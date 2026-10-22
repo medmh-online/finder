@@ -55,6 +55,12 @@ def render_workers(access,repo):
     with active:
         st.subheader(worker['name'])
         st.caption(f"New contacts initiated today: {db.daily_new_contact_used(picked)} / {worker['daily_new_contacts']} (UTC)")
+        generation=db.generation_quota(picked)
+        st.metric('AI generation attempts · rolling 24h', f"{generation['used']:,} / {generation['limit']:,}")
+        st.caption('Separate from token usage and new-contact limits. Failed Gemini API calls also count to prevent unlimited retries.')
+        if generation['remaining']==0:
+            st.error('AI replies are BLOCKED by the shared generation limit. Open "Shared business knowledge and quotas" above and raise the "Daily generation limit per worker" if appropriate, or wait for older requests to expire.')
+
         budget=db.tokens_today(picked)
         limit_now=int(worker.get('daily_token_limit') or 10000)
         st.progress(min(1.0,budget['total']/max(1,limit_now)))

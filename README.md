@@ -133,3 +133,12 @@ The connected WhatsApp client now accepts incoming events from both the standard
 Under **AI Workers → WhatsApp browser**, the **AI gateway intake** line shows matched/unmatched incoming event counts, pending replies and the most recent reply stage. These counters are read from the local database, not inferred from WhatsApp read receipts. If messages are unmatched, open **Why no AI reply?** for the assigned lead; opaque `@lid` identifiers must be verified by WhatsApp. If there are no recorded events at all, inspect `[WhatsApp inbound]`, `[event queue]` and `[WhatsApp event]` in the `START.bat` console.
 
 Run `npm run test` from the `whatsapp` directory to verify listener deduplication with synthetic messages, without starting the live service.
+
+
+## AI generation requests vs token budget (quota diagnostics)
+
+**Daily generation limit per worker** in *AI Workers → Shared business knowledge and quotas* is a rolling 24-hour limit on local Gemini request attempts. It is **independent** of the per-worker daily new-contact limit and token budget shown in Controls. Failed Gemini requests are counted to keep broken credentials and provider errors from issuing unlimited retries. The Controls tab shows usage versus this shared limit for the selected worker.
+
+When the request quota is exhausted, incoming messages remain recorded and **no Gemini reply is generated**. Pending conversations show the `daily_limit` reply trace; increase the shared daily generation limit deliberately if your usage policy allows it, or wait for requests to age out of the 24-hour window. Pending messages younger than 24 hours are eligible again when quota becomes available, subject to the worker's other controls and verification. The system never bypasses a customer opt-out.
+
+To investigate on the local PC, run `RUN_AI_REPLY_DIAGNOSTICS.bat`. The report shows the number of AI generation attempts used (including errors) and the configured limit without printing customer messages, phone numbers or keys. The WhatsApp service may return HTTP 404 to a GET `/health` request because that endpoint is not supported; the diagnostic treats that as a reachable server rather than falsely claiming it is offline.

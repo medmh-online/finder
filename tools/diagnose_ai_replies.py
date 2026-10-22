@@ -11,7 +11,7 @@ from pathlib import Path
 import sqlite3
 import sys
 import time
-from urllib import request
+from urllib import request, error
 
 ROOT=Path(__file__).resolve().parent.parent
 sys.path.insert(0,str(ROOT))
@@ -40,6 +40,9 @@ def http_health(port):
     try:
         with request.urlopen(f'http://127.0.0.1:{port}/health',timeout=2) as r:
             return r.status==200
+    except error.HTTPError as exc:
+        # A WhatsApp gateway with no GET /health endpoint returns 404 but is online.
+        return exc.code in (400,401,403,404,405)
     except Exception:return False
 
 
@@ -110,6 +113,13 @@ def report(db,token_path,lead_id=None):
         p('  Model selected='+('yes' if w['model_name'] else 'no')+
           f' | tested matching keys={goodkeys}'+
           (' | token_cap='+str(w['daily_token_limit']) if 'daily_token_limit' in worker_columns else ''))
+        if 'ai_usage' in ts and 'ai_account_settings' in ts:
+            limit=scalar(c,'SELECT daily_ai_limit FROM ai_account_settings WHERE id=1')
+            used=scalar(c,"""SELECT COUNT(*) FROM ai_usage WHERE worker_id=?
+                AND purpose IN ('reply','memory','intro','intro_draft') AND recorded_at>=?""",(wid,now-86400))
+            p(f'  AI generation attempts, last 24h: {used}/{limit}'+
+              (' — BLOCKED: raise the shared generation limit or wait for reset' if used>=limit else ''))
+
         recent_in=scalar(c,"SELECT COUNT(*) FROM ai_messages WHERE worker_id=? AND direction='in' AND created_at>?",(wid,now-3600))
         old_in=scalar(c,"SELECT COUNT(*) FROM ai_messages WHERE worker_id=? AND direction='in'",(wid,))
         unmatched=scalar(c,"SELECT COUNT(*) FROM ai_unmatched WHERE worker_id=? AND body NOT LIKE '[Outgoing] %'",(wid,))

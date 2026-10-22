@@ -819,10 +819,15 @@ class WorkerDB:
                 VALUES(?,?,?,?,?,?,?,?,?)''',(worker_id,key_id,model,purpose,input_tokens,output_tokens,str(error)[:300],now(),lead_id))
 
     def due(self):
-        """Lease one stable conversation at a time; no duplicate concurrent replies."""
+        """Lease one eligible reply without starving other leads at a quota boundary.
+
+        A worker-wide daily request limit is independent of its new-contact
+        and token limits. When exhausted, no Gemini calls are attempted; each
+        pending lead instead receives an actionable trace explaining the block.
+        """
         with self.connect(True) as c:
             t=now()
-            rows=c.execute('''SELECT t.*, a.worker_id,w.batchING_seconds,w.model_name,w.model_key_id,
+            rows=c.execute('''SELECT t.*, a.worker_id,w.batching_seconds,w.model_name,w.model_key_id,
                   w.followup_enabled,w.followup_hours,l.name,l.niche,l.city,l.website_url,
                   l.do_not_contact,p.opted_in,p.opted_out_at
                 FROM ai_threads t JOIN ai_assignments a ON a.lead_id=t.lead_id
@@ -833,18 +838,44 @@ class WorkerDB:
                   COALESCE(t.retry_after,0)<=?
                   AND (t.in_progress=0 OR t.lease_at<?)
                   AND t.last_inbound<=?
+                  AND t.last_inbound>?
+                  AND l.do_not_contact=0
+                  AND COALESCE(p.opted_out_at,0)=0
                   AND NOT EXISTS (SELECT 1 FROM ai_lead_control z WHERE z.lead_id=t.lead_id AND (z.paused=1 OR z.handoff=1))
-                  ORDER BY t.last_inbound LIMIT 25''', (t,t-180,t-2)).fetchall()
+                  ORDER BY t.last_inbound LIMIT 1000''', (t,t-180,t-2,t-86400)).fetchall()
+            quota_cache={}
             for row in rows:
                 latest=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",(row['lead_id'],)).fetchone()[0] or 0
-                if latest <= row['replied_through'] or t-row['last_inbound'] < row['batching_seconds'] or t-row['last_inbound'] > 86400:
+                if latest <= row['replied_through'] or t-row['last_inbound'] < row['batching_seconds']:
                     continue
-                if not row['model_name'] or not self.token_budget_available(row['worker_id']):
+                worker_id=row['worker_id']
+                if worker_id not in quota_cache:
+                    quota_limit=int(c.execute('SELECT daily_ai_limit FROM ai_account_settings WHERE id=1').fetchone()[0])
+                    used=int(c.execute('''SELECT COUNT(*) FROM ai_usage WHERE worker_id=?
+                        AND purpose IN ('reply','memory','intro','intro_draft') AND recorded_at>=?''',
+                        (worker_id,t-86400)).fetchone()[0])
+                    quota_cache[worker_id]=(used,quota_limit)
+                used,limit=quota_cache[worker_id]
+                if used >= limit:
+                    previous=c.execute('SELECT stage FROM ai_reply_trace WHERE lead_id=?',(row['lead_id'],)).fetchone()
+                    if not previous or previous['stage']!='daily_limit':
+                        self._trace_in_tx(c,row['lead_id'],worker_id,'daily_limit',
+                            f'Daily AI generation request limit reached ({used}/{limit}; rolling 24 hours). Raise the shared generation limit or wait for requests to expire.')
                     continue
-                if not self._acquire_generation_in_tx(c,row['worker_id'],t):
+                if not row['model_name']:
+                    previous=c.execute('SELECT stage FROM ai_reply_trace WHERE lead_id=?',(row['lead_id'],)).fetchone()
+                    if not previous or previous['stage']!='model_unavailable':
+                        self._trace_in_tx(c,row['lead_id'],worker_id,'model_unavailable','No Gemini model selected')
+                    continue
+                if not self.token_budget_available(worker_id):
+                    previous=c.execute('SELECT stage FROM ai_reply_trace WHERE lead_id=?',(row['lead_id'],)).fetchone()
+                    if not previous or previous['stage']!='token_limit':
+                        self._trace_in_tx(c,row['lead_id'],worker_id,'token_limit','Worker daily token budget exhausted')
+                    continue
+                if not self._acquire_generation_in_tx(c,worker_id,t):
                     continue
                 c.execute('UPDATE ai_threads SET in_progress=1,lease_at=? WHERE lead_id=?',(t,row['lead_id']))
-                self._trace_in_tx(c,row['lead_id'],row['worker_id'],'generating','Gemini decision in progress')
+                self._trace_in_tx(c,row['lead_id'],worker_id,'generating','Gemini decision in progress')
                 return {**dict(row),'latest_inbound_id':latest}
         return None
 
@@ -1032,10 +1063,25 @@ class WorkerDB:
                 FROM leads l LEFT JOIN ai_permissions p ON p.lead_id=l.id WHERE l.id=?''',(lead_id,)).fetchone()
         return bool(row and not row['do_not_contact'] and not row['archived'] and not row['opted_out_at'] and (not require_optin or row['opted_in']))
 
-    def daily_used(self,worker_id):
-        threshold=now()-86400
+    def generation_quota(self, worker_id):
+        """Rolling-24-hour AI request counter, including provider failures.
+
+        This intentionally measures attempts, not tokens. Failed calls still
+        count so a misconfigured API key cannot generate unbounded traffic.
+        """
+        cutoff=now()-86400
         with self.connect() as c:
-            return c.execute('SELECT COUNT(*) FROM ai_usage WHERE worker_id=? AND purpose IN ("reply","memory","intro","intro_draft") AND recorded_at>=?',(worker_id,threshold)).fetchone()[0]
+            limit=int(c.execute('SELECT daily_ai_limit FROM ai_account_settings WHERE id=1').fetchone()[0])
+            row=c.execute('''SELECT COUNT(*) AS used, MIN(recorded_at) AS oldest
+                FROM ai_usage WHERE worker_id=?
+                  AND purpose IN ('reply','memory','intro','intro_draft')
+                  AND recorded_at>=?''',(worker_id,cutoff)).fetchone()
+            used=int(row['used'])
+            return {'used':used,'limit':limit,'remaining':max(0,limit-used),
+                    'next_expiry':float(row['oldest'])+86400 if row['oldest'] is not None else None}
+
+    def daily_used(self,worker_id):
+        return self.generation_quota(worker_id)['used']
 
     def context(self,lead_id):
         with self.connect() as c:
