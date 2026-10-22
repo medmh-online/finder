@@ -36,3 +36,20 @@ Fresh-install ZIP contains no old databases, accounts, keys or sessions. A new f
 ## Testing and limitations
 
 Source files pass Python bytecode compilation and Node.js syntax checks. A focused isolated test confirmed SQLite batch creation, lookup→verified `@lid`→send→sent status, no duplicate resend, mismatched ID rejection and additive migration. **Live Gemini API calls, QR pairing and actual WhatsApp delivery could not be tested here**, so test using one authorized phone number on your PC before larger batches. `whatsapp-web.js` is unofficial and can break with WhatsApp Web updates.
+
+## Source layout and services
+
+- `START.bat` runs `run_ai.py`, which launches the Streamlit dashboard (`launch.py` / `app.py`), the Python AI bridge (`ai_server.py`, loopback port 8766), the queue runner (`queue_runner.py`), and the **one canonical** WhatsApp gateway (`whatsapp/server.js`, loopback port 8767).
+- `leadfinder/` contains the shared Python modules for discovery, CRM, AI conversations, queues, and persistence. The previously duplicated `leadfinder/whatsapp/server.js` was consolidated into `whatsapp/server.js` and removed; do not launch or recreate the old copy.
+- The canonical WhatsApp gateway includes bounded, verified `@lid` identity recovery for assigned contacts when WhatsApp cannot directly expose a sender phone. This checks assigned registration mappings and does not send messages itself.
+
+## Local data and repository housekeeping
+
+- Keep the existing `leads.db` and other SQLite databases, Gemini encryption keys, bridge token, WhatsApp sessions, Chrome worker profiles, and pending event files when updating an existing installation. These are installation-specific data, not disposable source files.
+- `INSTALL_LOG.txt` is installer output. `queue_dispatcher_status.json` is a queue-runner heartbeat. Both are generated at runtime and ignored for **new** Git additions; the cleanup patch does not delete them.
+- `.venv/`, `.streamlit/secrets.toml`, and `whatsapp/session_backups/` are also excluded from new Git additions. Git ignore rules do **not** automatically untrack files that were already committed; review tracked runtime files and their history before removing them from version control.
+- `PROPOSED_PRICING_FOR_BUSINESS_KNOWLEDGE.txt` is a manual, unapproved pricing reference, not active application configuration; it was retained to avoid losing business notes. Never treat its estimates as approved client quotes.
+
+## Source checks (no live WhatsApp or Gemini activity)
+
+From the project root after installing dependencies, run `cd whatsapp` then `npm run check` to syntax-check the canonical WhatsApp gateway. Python source can be syntax-checked without starting workers with `python -m compileall -q app.py ai_server.py leadfinder`. These checks do not verify delivery, pairing, or API access.
