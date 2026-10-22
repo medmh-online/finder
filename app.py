@@ -711,15 +711,67 @@ def confirm_delete_dialog(lead_id, repo, access):
         st.session_state.pop('_confirm_delete_lead',None);st.rerun()
 
 
+@st.dialog('Clear all leads permanently?')
+def confirm_clear_all_leads_dialog(repo, access, count):
+    st.error(f'This will permanently remove ALL {count:,} leads, including archived and blocked leads.')
+    st.write('Lead CRM history, worker assignments and linked AI conversations will also be deleted.')
+    st.caption('Kept: worker settings and Gemini keys, WhatsApp sessions, standalone Message Queue batches, saved campaigns/search history, token accounting, and the global do-not-contact list.')
+    st.warning('First stop queued/running Discovery jobs and disable AI workers handling leads. A verified SQLite backup is created before deletion.')
+    confirmation = f'DELETE {count} LEADS'
+    typed = st.text_input(f'Type {confirmation} to confirm', key='clear_leads_confirmation')
+    col_confirm, col_cancel = st.columns(2)
+    if col_confirm.button('Delete all leads', type='primary', disabled=typed != confirmation, use_container_width=True):
+        try:
+            from leadfinder.ai_workers import WorkerDB
+            from leadfinder.ai_outreach import GlobalContactLedger
+            from leadfinder.config import app_paths
+            # Do not incur backup cost until both the user and runtime approve.
+            repo.check_clear_all_leads(count)
+            db = WorkerDB(access.paths().database).initialize()
+            opt_out_phones = db.opted_out_phones()
+            with st.spinner('Backing up database, preserving opt-outs, and deleting leads...'):
+                backup_path = repo.backup()
+                ledger = GlobalContactLedger(app_paths().data)
+                for phone in opt_out_phones:
+                    ledger.block(phone)
+                removed = repo.clear_all_leads(expected_count=count)
+            for key in list(st.session_state):
+                if (key.startswith('lead_filter_') or key.startswith('lead_editor_')
+                        or key.startswith('_detail_snapshot_') or key.startswith('_detail_revision_')):
+                    st.session_state.pop(key, None)
+            for key in ('_lead_table_widget','_lead_table_drafts','_lead_table_selected',
+                        '_lead_grid_failed_drafts','_lead_grid_errors','_lead_view_state',
+                        '_confirm_delete_lead','_lead_chat_dialog','_clear_all_leads_dialog',
+                        'leads_page_number','clear_leads_confirmation'):
+                st.session_state.pop(key, None)
+            notify(f'{removed:,} leads deleted. SQLite safety backup: {backup_path}')
+            st.rerun()
+        except (ValueError, RuntimeError, sqlite3.Error, OSError) as exc:
+            st.error(str(exc))
+    if col_cancel.button('Cancel', use_container_width=True):
+        st.session_state.pop('_clear_all_leads_dialog', None)
+        st.session_state.pop('clear_leads_confirmation', None)
+        st.rerun()
+
+
 def render_leads(repo: Repository, config: dict, paths: AppPaths, access: WorkspaceAccess) -> None:
     restore_lead_view()
-    st.header("Leads")
     capture_active_table()
     all_leads = frame_for(repo)
+    header, clear_control = st.columns([5, 1.25], vertical_alignment='center')
+    header.header("Leads")
+    if clear_control.button('Clear all leads', key='open_clear_all_leads',
+                            disabled=all_leads.empty, use_container_width=True):
+        st.session_state.pop('_confirm_delete_lead', None)
+        st.session_state.pop('_lead_chat_dialog', None)
+        st.session_state['_clear_all_leads_dialog'] = True
     if all_leads.empty:
         st.info("Your leads will appear here after a search. Create a campaign to begin.")
         st.button("Create campaign", on_click=go_to, args=("Discovery",))
+        st.session_state.pop('_clear_all_leads_dialog', None)
         return
+    if st.session_state.get('_clear_all_leads_dialog'):
+        confirm_clear_all_leads_dialog(repo, access, len(all_leads))
     search = st.text_input('Search businesses, phones, locations or notes',key='lead_filter_search')
     with st.expander('Filters · Sort / Pagination',expanded=False):
         a,b,c=st.columns(3)

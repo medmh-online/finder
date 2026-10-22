@@ -65,3 +65,9 @@ Source files pass Python bytecode compilation and Node.js syntax checks. A focus
 ## Source checks (no live WhatsApp or Gemini activity)
 
 From the project root after installing dependencies, run `cd whatsapp` then `npm run check` to syntax-check the canonical WhatsApp gateway. Python source can be syntax-checked without starting workers with `python -m compileall -q app.py ai_server.py leadfinder`. These checks do not verify delivery, pairing, or API access.
+
+## Clearing all leads (local dashboard)
+
+On the **Leads** page choose **Clear all leads**, then type the exact displayed phrase (`DELETE N LEADS`). The operation includes archived and blocked leads. It deletes leads, their CRM history, AI assignments and linked conversations, while retaining search campaigns/job history, worker settings, Gemini keys, WhatsApp sessions, standalone Message Queue batches, token usage totals and the persistent installation-wide do-not-contact ledger. Historical job candidate references are cleared. Future search jobs can rediscover the same businesses.
+
+Before clearing, stop/cancel queued or active Discovery jobs and disable AI workers with assigned leads. PCC updates alone do not restore an already-cleared live database; the action creates a verified SQLite backup in the project's `backups/` directory prior to deletion. A failed transactional clear preserves the original database and keeps its backup. Back up that directory securely if you need the original lead records later. Do not remove global blocked-contact records when resetting leads.

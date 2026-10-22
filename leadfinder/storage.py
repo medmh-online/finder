@@ -901,6 +901,92 @@ class Repository:
                 raise ValueError("The selected lead could not be deleted. Refresh the table.")
             return {"id": lead_id, "name": lead["name"]}
 
+    @staticmethod
+    def _check_clear_all_leads(conn, expected_count):
+        """Guard mass deletion against active collection and AI tasks.
+
+        Call under a read transaction for preview, and under BEGIN IMMEDIATE
+        immediately before deleting, so a concurrent writer cannot pass the
+        count check and then silently add or change leads.
+        """
+        count = conn.execute("SELECT COUNT(*) FROM leads").fetchone()[0]
+        if count != expected_count:
+            raise ValueError("The number of leads changed. Close this dialog, refresh and confirm again.")
+        if not count:
+            raise ValueError("There are no leads to clear.")
+        active = conn.execute("""SELECT id FROM jobs
+            WHERE state IN ('queued','running','pause_requested','cancel_requested')
+                OR (worker_token IS NOT NULL AND worker_token!='')
+            LIMIT 1""").fetchone()
+        if active:
+            raise ValueError(
+                f"Search job #{active['id']} is queued or active. Finish or cancel queued/running jobs before clearing leads."
+            )
+        ai_tables = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'ai_%'"
+        )}
+        if {'ai_workers', 'ai_assignments'} <= ai_tables:
+            active_worker = conn.execute("""SELECT w.name FROM ai_workers w
+                JOIN ai_assignments a ON a.worker_id=w.id
+                WHERE w.enabled=1 LIMIT 1""").fetchone()
+            if active_worker:
+                raise ValueError(
+                    "Disable AI replies for all workers with assigned leads before clearing: "
+                    + str(active_worker['name'])
+                )
+        if 'ai_threads' in ai_tables:
+            busy_thread = conn.execute("""SELECT lead_id FROM ai_threads
+                WHERE in_progress=1 AND lease_at>? LIMIT 1""",
+                (__import__('time').time()-180,)).fetchone()
+            if busy_thread:
+                raise ValueError("An AI conversation is being processed. Stop AI workers and try again.")
+        if 'ai_messages' in ai_tables:
+            sending = conn.execute("""SELECT id FROM ai_messages
+                WHERE lead_id IS NOT NULL AND direction='out' AND status='sending'
+                LIMIT 1""").fetchone()
+            if sending:
+                raise ValueError("A lead message is still sending. Stop the AI sender before clearing leads.")
+        return ai_tables
+
+    def check_clear_all_leads(self, expected_count):
+        """Read-only preflight for the Leads page before it creates a backup."""
+        expected_count = _integer(expected_count, 'expected lead count', 1)
+        with self._read() as conn:
+            self._check_clear_all_leads(conn, expected_count)
+        return expected_count
+
+    def clear_all_leads(self, *, expected_count):
+        """Clear ALL leads and their linked CRM/AI data in one transaction.
+
+        Preserve independent worker accounts/keys, queue batches, global opt-out
+        ledger, campaigns, saved jobs and aggregate AI token accounting. The UI
+        is responsible for taking a backup and transferring lead opt-outs to
+        the installation-wide ledger before calling this destructive method.
+        """
+        expected_count = _integer(expected_count, 'expected lead count', 1)
+        with self._write() as conn:
+            ai_tables = self._check_clear_all_leads(conn, expected_count)
+            # Retain historical jobs/candidates, but do not leave stale lead IDs.
+            conn.execute("UPDATE job_candidates SET lead_id=NULL,updated_at=? WHERE lead_id IS NOT NULL", (utc_now(),))
+            for table in ('activities', 'lead_sources', 'lead_discoveries'):
+                conn.execute(f'DELETE FROM {table}')
+            if 'ai_messages' in ai_tables:
+                # ai_messages has ON DELETE SET NULL; delete linked conversations
+                # explicitly BEFORE leads so they do not become unmatched history.
+                conn.execute('DELETE FROM ai_messages WHERE lead_id IS NOT NULL')
+            if 'ai_first_contact_attempts' in ai_tables:
+                conn.execute('DELETE FROM ai_first_contact_attempts WHERE lead_id IN (SELECT id FROM leads)')
+            if 'ai_usage' in ai_tables:
+                # Keep Gemini cost accounting intact, but remove deleted lead IDs.
+                conn.execute('UPDATE ai_usage SET lead_id=NULL WHERE lead_id IS NOT NULL')
+            removed = conn.execute('DELETE FROM leads')
+            if removed.rowcount != expected_count:
+                raise RuntimeError('Lead deletion count did not match the confirmed count; all changes were rolled back.')
+            problems = conn.execute('PRAGMA foreign_key_check').fetchall()
+            if problems:
+                raise RuntimeError('Database foreign-key validation failed; the deletion was rolled back.')
+            return removed.rowcount
+
     def bulk_update(self, ids, changes):
         changes = self._validate_changes(changes)
         ids = list(dict.fromkeys(_integer(value, "lead ID", 1) for value in ids))
