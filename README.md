@@ -9,18 +9,30 @@ This is a complete clean project, **not a patch**. It combines the v3.9 Message 
 3. Double-click **START.bat**. Keep that window open.
 4. Open **http://127.0.0.1:8502** (local-only dashboard, no login).
 5. Go to **AI Workers**. Create a worker, enter Gemini API keys (one per line), test/select a working model, open the worker's Chrome window, sign in to WhatsApp and attach AI. Only status **ready** can send.
-6. Go to **Message Queue**, choose that worker, paste your numbers, type the message, and choose a country. Click **Normalize numbers with Gemini & preview**. Review the prepared batch, then click **Start**.
+6. Go to **Message Queue**, choose that worker, paste your numbers, type the message, and choose a country. Click **Normalize numbers locally & preview**. Review the prepared batch, then click **Start**.
 
 ## Standalone Message Queue
 
 - **No Leads or CRM records are created.** Number lists and sent history are saved separately in SQLite.
-- Gemini uses the selected worker's existing key pool and model for **phone-number normalization**, not message rewriting. Your outgoing message remains unchanged.
+- The queue uses the installed `phonenumbers` Python library to **normalize numbers locally without any Gemini call**. Your outgoing message remains unchanged. The worker's Gemini model remains relevant for AI conversation replies, not for preparing the queue.
 - Original numbers, validated international numbers, and WhatsApp's **verified chat ID** are displayed. The ID is not guessed: after lookup it may be `212...@c.us` or an opaque `...@lid`.
 - The WhatsApp worker must be **ready**. The number is checked for registration through its existing WhatsApp Web connection before sending.
 - Each worker sends **one message at a time**, sharing its sending slot with AI replies. The next recipient uses the configured random interval; worker daily limits also apply.
 - Queue controls: **Start, Pause, Resume, Cancel**. The independent `queue_runner.py` process saves its heartbeat, PID, database path and errors to a local status file.
 - In-flight/uncertain sends are **never automatically resent** after failure. Repeated numbers are shown and retained as distinct entries—inspect them carefully before starting.
 - Global **do-not-contact** requests are still respected. Public availability of a number alone is not permission for automated marketing; use this feature for recipients you're authorized to message.
+
+
+## Phone matching and AI usage
+
+- Incoming WhatsApp messages are matched to a lead **locally**, using the saved lead's ISO country and canonical E.164 number. Local forms (`06...`), explicit international prefixes (`00212...`, `+212...`) and spaced/formatted numbers are resolved without Gemini. Both `phone` and `phone_e164` are checked; conflicting valid identities are rejected rather than guessed.
+- The match is scoped to leads **assigned to that WhatsApp worker**. An ambiguous duplicate number is not auto-linked. Existing opt-outs, permissions and reply gating remain in force. A successful match may still lead to a Gemini call to **write the actual conversational reply**.
+- An `@lid` identifier is **not a phone number**. A message using it requires a previously linked chat or a number verified by WhatsApp's identity-mapping APIs. Never substitute the digits of an `@lid` ID for a phone number.
+- The standalone Message Queue also normalizes with `phonenumbers` locally and does not need a Gemini model for queue preparation. Its WhatsApp registration checks and sending still require a ready worker.
+
+### Matching regression tests
+
+After installing the project dependencies, run `python -m unittest discover -s tests -p test_phone_normalization.py -v` from the project root. These tests use only temporary in-memory SQLite data; they do not contact Gemini, WhatsApp, or real recipients.
 
 ## Diagnostic notes
 

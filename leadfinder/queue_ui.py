@@ -30,7 +30,7 @@ def _display_send_status(item):
 def render_queue(access):
     db=init_queue(WorkerDB(access.paths().database))
     st.header('Message Queue')
-    st.caption('Standalone number lists · no Leads or CRM records · uses existing WhatsApp workers and Gemini keys')
+    st.caption('Standalone number lists · no Leads or CRM records · local number normalization')
     workers=db.workers()
     if not workers:
         st.info('Create a WhatsApp worker in AI Workers first.')
@@ -57,13 +57,13 @@ def render_queue(access):
         numbers=st.text_area('Numbers · one per line, comma or semicolon',height=135,
             placeholder='06 12 34 56 78\n00212 6 98 76 54 32\n+212 6 61 23 45 67',key='sq_numbers')
         country=st.selectbox('Default number country',['MA','FR','BE','ES','GB','US','DZ','TN'],key='sq_country')
-        st.caption('Gemini uses the selected worker’s model and key pool to normalize phone numbers once. Invalid or ambiguous numbers are rejected. Original order is preserved.')
+        st.caption('Phone numbers are normalized and validated locally (no Gemini tokens). Invalid or ambiguous numbers are skipped. Original order is preserved.')
         msg=st.text_area('Message · sent exactly as written',height=95,key='sq_message',
             placeholder='Type the message to send unchanged to each valid number.')
         a,b=st.columns(2)
         lo=a.number_input('Minimum gap between sends (seconds)',1,3600,5,key='sq_min')
         hi=b.number_input('Maximum gap between sends (seconds)',1,3600,30,key='sq_max')
-        if st.button('Normalize numbers with Gemini & preview',type='primary',key='sq_prepare'):
+        if st.button('Normalize numbers locally & preview',type='primary',key='sq_prepare'):
             try:
                 batch=prepare(db,selected,numbers,msg,country,lo,hi)
                 st.session_state['sq_inspect']=batch

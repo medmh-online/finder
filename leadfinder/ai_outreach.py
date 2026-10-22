@@ -7,6 +7,8 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
+import unicodedata
 from pathlib import Path
 import sqlite3
 import time
@@ -16,28 +18,44 @@ from phonenumbers import PhoneNumberFormat, NumberParseException
 
 
 def normalize_phone(raw, country=''):
-    """Return valid E.164 or an empty string. Never guess unknown local regions."""
-    value = str(raw or '').strip()
-    if not value:
+    """Normalize supported phone formats locally to a single valid E.164 number.
+
+    This operation NEVER calls Gemini or a network service. National numbers
+    require their ISO country code. We try common explicit international forms
+    (such as 00CC..., CC..., +CC...) but never use dangerous suffix matching.
+    """
+    value = unicodedata.normalize('NFKC', str(raw or '')).strip()
+    value = re.sub(r'[\u200b-\u200f\u2060\ufeff]', '', value)
+    if not value or len(value) > 100:
         return ''
-    value = value.replace('\u00a0', ' ').replace('\u200e', '').replace('\u200f', '')
-    # Use ISO region, preferably from lead.country_code; local numbers require it.
     region = str(country or '').strip().upper()
     if len(region) != 2 or not region.isalpha():
         region = None
-    if value.startswith('00') and region is None:
-        value = '+' + value[2:]
-    # Try a numeric international prefix only when no national region is known.
-    # Never reinterpret short/ambiguous local numbers as international.
-    if region is None and value[0:1].isdigit() and len(''.join(ch for ch in value if ch.isdigit())) >= 11:
-        value = '+' + value
-    try:
-        number = phonenumbers.parse(value, region)
-        if not phonenumbers.is_valid_number(number):
-            return ''
-        return phonenumbers.format_number(number, PhoneNumberFormat.E164)
-    except (NumberParseException, TypeError, ValueError):
-        return ''
+    forms = [value]
+    digits = ''.join(ch for ch in value if ch.isascii() and ch.isdigit())
+    compact = re.sub(r'[\s().\-]', '', value)
+    # Explicit 00 international prefix; covers "00 212 ..." too.
+    if compact.startswith('00') and compact[2:].isdigit():
+        forms.append('+' + compact[2:])
+    if compact.isdigit() and len(compact) >= 8:
+        # Some spreadsheets store 212612345678 without the leading plus.
+        if region:
+            dial = phonenumbers.country_code_for_region(region)
+            if dial and compact.startswith(str(dial)):
+                forms.append('+' + compact)
+        elif len(digits) >= 11 and not compact.startswith('0'):
+            forms.append('+' + compact)
+    # A valid number must produce just one canonical identity, regardless of
+    # how it was written. Never guess between two different valid identities.
+    identities = set()
+    for form in dict.fromkeys(forms):
+        try:
+            parsed = phonenumbers.parse(form, region)
+            if phonenumbers.is_valid_number(parsed):
+                identities.add(phonenumbers.format_number(parsed, PhoneNumberFormat.E164))
+        except (NumberParseException, TypeError, ValueError):
+            pass
+    return next(iter(identities)) if len(identities) == 1 else ''
 
 
 class GlobalContactLedger:

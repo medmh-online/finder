@@ -522,7 +522,7 @@ class WorkerDB:
             rows=c.execute('''SELECT l.phone_e164,l.phone,l.country_code FROM leads l
                 LEFT JOIN ai_permissions p ON p.lead_id=l.id
                 WHERE l.do_not_contact=1 OR p.opted_out_at IS NOT NULL''').fetchall()
-            return sorted({x for r in rows if (x:=self._lead_phone(r))})
+            return sorted({x for r in rows if (x:=normalize_phone(r['phone_e164'] or r['phone'],r['country_code']))})
 
     def permission(self, lead_id, consent, source='', proof=''):
         # Never reset an existing opt-out merely by bulk-marking consent.
@@ -542,58 +542,28 @@ class WorkerDB:
 
     @staticmethod
     def _lead_phone(row):
-        """Canonical E.164 identity for the *current displayed* lead phone.
+        """One canonical lead identity from both saved phone fields, without AI.
 
-        Editing a phone through Leads clears the cached phone_e164 field. Older
-        databases can nevertheless retain a stale cached value; it must never
-        override a valid current phone. The original spelling is preserved.
+        Both representations may contain spacing or local/country prefixes.
+        Conflicting *valid* numbers require owner review rather than guessing
+        which phone belongs to the person who wrote to this WhatsApp worker.
         """
-        region = row['country_code'] or ''
-        visible = str(row['phone'] or '').strip()
-        if visible:
-            current = normalize_phone(visible, region)
-            if current:
-                return current
-            # Handle an explicitly international phone entered without '+' in
-            # older imported lead lists (e.g. 212624469576). Do not guess a
-            # country from an ambiguous local number like 0624469576.
-            if re.fullmatch(r'[+0-9().\s-]+', visible):
-                compact = re.sub(r'[().\s-]', '', visible)
-                if compact.startswith('00'):
-                    return normalize_phone('+' + compact[2:]) or ''
-                if re.fullmatch(r'[1-9]\d{10,14}', compact):
-                    return normalize_phone('+' + compact) or ''
-            # If an edited number is invalid, DO NOT match an old cached number.
-            return ''
-        return normalize_phone(row['phone_e164'], region) or ''
+        region = row['country_code']
+        phones = {number for field in ('phone_e164', 'phone')
+                  if (number := normalize_phone(row[field], region))}
+        return next(iter(phones)) if len(phones) == 1 else ''
 
     @staticmethod
     def _sender_phone(chat_id, phone_hint=''):
-        """Normalize WhatsApp's verified sender phone, never opaque LID digits.
-
-        A normal chat has an international phone in its @c.us ID. An @lid chat
-        is allowed ONLY with a phone positively resolved by the local WhatsApp
-        gateway. All formats become the same E.164 string used for leads.
-        """
-        chat = str(chat_id or '').strip()
-        if re.fullmatch(r'[1-9]\d{8,14}@c\.us', chat):
-            return normalize_phone('+' + chat.split('@', 1)[0])
-        if not re.fullmatch(r'\d{9,20}@lid', chat):
-            return ''
-        hint = str(phone_hint or '').strip()
-        if re.fullmatch(r'[1-9]\d{8,14}@c\.us', hint):
-            hint = '+' + hint.split('@', 1)[0]
-        # This is the phone that WhatsApp verified for the LID. Allow common
-        # punctuation/spacing in that phone but require an INTERNATIONAL prefix.
-        if not re.fullmatch(r'[+0-9().\s-]{11,36}', hint):
-            return ''
-        compact = re.sub(r'[().\s-]', '', hint)
-        if re.fullmatch(r'\+[1-9]\d{8,14}', compact):
-            return normalize_phone(compact)
-        if re.fullmatch(r'00[1-9]\d{8,14}', compact):
-            return normalize_phone('+' + compact[2:])
-        if re.fullmatch(r'[1-9]\d{10,14}', compact):
-            return normalize_phone('+' + compact)
+        # LID is not a phone number. Use only an explicitly verified @c.us hint.
+        if str(chat_id).endswith('@c.us'):
+            user = str(chat_id).split('@', 1)[0]
+            if not re.fullmatch(r'\d{9,15}', user):
+                return ''
+            return normalize_phone('+' + user)
+        if str(chat_id).endswith('@lid') and isinstance(phone_hint, str):
+            if re.fullmatch(r'\+\d{9,15}', phone_hint):
+                return normalize_phone(phone_hint)
         return ''
 
     def _match_lead(self, c, worker_id, chat, phone_hint=''):
@@ -970,7 +940,7 @@ class WorkerDB:
             row=c.execute('SELECT chat_id FROM ai_messages WHERE lead_id=? ORDER BY id DESC LIMIT 1',(lead_id,)).fetchone()
             if row:return row['chat_id']
             row=c.execute('SELECT phone_e164,phone,country_code FROM leads WHERE id=?',(lead_id,)).fetchone()
-            number=digits(self._lead_phone(row)) if row else ''
+            number=digits(normalize_phone(row['phone_e164'] or row['phone'],row['country_code'])) if row else ''
             return number+'@c.us' if len(number)>=9 else ''
 
     def can_message(self,lead_id,require_optin=True):
@@ -990,7 +960,7 @@ class WorkerDB:
                 raise ValueError('Verified consent is needed before outbound initiation')
             last=c.execute('SELECT chat_id FROM ai_messages WHERE lead_id=? ORDER BY id DESC LIMIT 1',(lead_id,)).fetchone()
             lead=c.execute('SELECT phone_e164,phone,country_code FROM leads WHERE id=?',(lead_id,)).fetchone()
-            chat=last['chat_id'] if last else digits(self._lead_phone(lead))+'@c.us'
+            chat=last['chat_id'] if last else digits(normalize_phone(lead['phone_e164'] or lead['phone'],lead['country_code']))+'@c.us'
             if not chat.endswith('@c.us') or len(digits(chat))<9:
                 raise ValueError('No supported phone/chat for this lead')
             c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at)
@@ -1078,7 +1048,7 @@ class WorkerDB:
     def contact_phone(self,lead_id):
         with self.connect() as c:
             lead=c.execute('SELECT phone_e164,phone,country_code FROM leads WHERE id=?',(lead_id,)).fetchone()
-            return self._lead_phone(lead) if lead else ''
+            return normalize_phone(lead['phone_e164'] or lead['phone'],lead['country_code']) if lead else ''
 
     def historical_outbound(self):
         """Previously sent messages are backfilled to the installation-wide ledger."""
@@ -1086,7 +1056,7 @@ class WorkerDB:
             rows=c.execute("""SELECT DISTINCT m.lead_id,m.worker_id,l.phone_e164,l.phone,l.country_code
                 FROM ai_messages m JOIN leads l ON l.id=m.lead_id
                 WHERE m.direction='out' AND m.status IN ('sent','uncertain')""").fetchall()
-            return [(self._lead_phone(r),r['worker_id'],r['lead_id'])
+            return [(normalize_phone(r['phone_e164'] or r['phone'],r['country_code']),r['worker_id'],r['lead_id'])
                     for r in rows]
 
     def intro_due(self, ledger=None, ready_worker_ids=None):
@@ -1115,7 +1085,7 @@ class WorkerDB:
                     AND purpose IN ('reply','memory','intro','intro_draft') AND recorded_at>=?''',
                     (r['worker_id'],t-86400)).fetchone()[0]
                 if ai_calls>=ai_limit or not self.token_budget_available(r['worker_id']):continue
-                phone=self._lead_phone(r)
+                phone=normalize_phone(r['phone_e164'] or r['phone'],r['country_code'])
                 if not phone or (ledger and ledger.is_taken(phone)):
                     continue
                 if self._daily_first_in_tx(c,r['worker_id'],t)>=r['daily_new_contacts']:
@@ -1145,7 +1115,7 @@ class WorkerDB:
             if c.execute('SELECT 1 FROM ai_messages WHERE lead_id=? LIMIT 1',(lead_id,)).fetchone():
                 return None
             lead=c.execute('SELECT phone,phone_e164,country_code FROM leads WHERE id=?',(lead_id,)).fetchone()
-            phone=self._lead_phone(lead)
+            phone=normalize_phone(lead['phone_e164'] or lead['phone'],lead['country_code'])
             if not phone or phone!=task['canonical_phone']:
                 return None
             stamp=now()

@@ -1,19 +1,19 @@
 """Standalone, manually supplied recipient queue.
 
 Never creates or updates Leads/CRM, assignments, permissions, AI threads, or
-lead messages. Uses workers only for WhatsApp transport and Gemini number
+lead messages. Uses workers for WhatsApp transport and local phone-number
 normalization. Explicit global stop requests still take precedence.
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import json
 import random
 import re
 import time
 import uuid
 
 from .ai_runtime import app_paths, node_api
+from .ai_outreach import normalize_phone
 
 COUNTRY_DIAL = {'MA':'212','FR':'33','BE':'32','ES':'34','GB':'44','US':'1','DZ':'213','TN':'216'}
 
@@ -25,54 +25,16 @@ def parse_numbers(raw, limit=100):
     return items
 
 
-def validate_normalized(candidate, original, default_cc='212'):
-    """Exactly mirrors the v4 sender's non-hallucinating validation.
+def normalize_locally(items, country='MA'):
+    """Validate phone formats with offline libphonenumber metadata, no Gemini.
 
-    Gemini can remove punctuation and standard local prefixes, but it cannot
-    add, replace or invent any of the user's significant digits.
+    No guessing missing digits, no matching by last N digits, and no AI token
+    usage. Items are returned in their original order; unknowns stay empty.
     """
-    initial=re.sub(r'\D','',str(original or ''))
-    expected=initial[2:] if initial.startswith('00') else initial
-    if expected.startswith('0'):
-        expected=default_cc+expected[1:]
-    elif len(expected)==9 and default_cc=='212' and re.match(r'^[567]',expected):
-        expected=default_cc+expected
-    output=re.sub(r'\D','',str(candidate or ''))
-    if re.fullmatch(r'\d{8,15}',output) and output==expected and not output.startswith('0'):
-        return '+'+output
-    return ''
-
-
-def _extract_json(response):
-    raw=str(response or '').strip()
-    if raw.startswith('```'):
-        raw=re.sub(r'^```(?:json)?\s*','',raw,flags=re.I)
-        raw=re.sub(r'\s*```$','',raw)
-    try:return json.loads(raw)
-    except ValueError as ex:raise ValueError('Gemini returned invalid JSON. Nothing was queued.') from ex
-
-
-def normalize_with_gemini(db,worker,items,country='MA'):
-    from .ai_agent import gemini_with_fallback
-    dial=COUNTRY_DIAL.get(str(country).upper())
-    if not dial:raise ValueError('Choose a supported country.')
-    prompt=(
-        f'Normalize WhatsApp phone numbers. Default country calling code {dial}. '
-        'Clean punctuation/spaces and leading 00/local 0 prefixes only. '
-        'Never guess missing digits. Reply ONLY with JSON exactly shaped '
-        '{"numbers":[{"normalized":"digits only or empty string"}]} in the original order. '
-        'INPUT: '+json.dumps(items,ensure_ascii=False)
-    )
-    # Same one-batch Gemini normalization as WhatsApp-Gemini-Queue v4.
-    result,_=gemini_with_fallback(db,worker,app_paths().data,
-        'Output valid JSON only; never invent phone digits.',
-        [{'role':'user','parts':[{'text':prompt}]}],purpose='queue_normalize',max_tokens=min(3600,max(500,len(items)*37)))
-    parsed=_extract_json(result)
-    rows=parsed.get('numbers') if isinstance(parsed,dict) else None
-    if not isinstance(rows,list) or len(rows)!=len(items):
-        raise ValueError('Gemini number count mismatch. Nothing was queued.')
-    return [validate_normalized(row.get('normalized') if isinstance(row,dict) else '',raw,dial)
-            for raw,row in zip(items,rows)]
+    region = str(country or '').strip().upper()
+    if region not in COUNTRY_DIAL:
+        raise ValueError('Choose a supported country.')
+    return [normalize_phone(item, region) for item in items]
 
 
 def init_queue(db):
@@ -126,13 +88,12 @@ def prepare(db,worker_id,raw_numbers,message,country='MA',min_gap=5,max_gap=30):
     init_queue(db)
     worker=db.worker(worker_id)
     if not worker:raise ValueError('Choose a worker.')
-    if not worker.get('model_name'):raise ValueError('Choose a tested Gemini model for this worker.')
     items=parse_numbers(raw_numbers)
     text=str(message or '').strip()
     if not text or len(text)>3000:raise ValueError('Message must be 1–3000 characters.')
     lo,hi=int(min_gap),int(max_gap)
     if not 1<=lo<=hi<=3600:raise ValueError('Choose a delay of 1–3600 seconds, with max >= min.')
-    normalized=normalize_with_gemini(db,worker,items,country)
+    normalized=normalize_locally(items,country)
     batch_id=uuid.uuid4().hex
     t=time.time()
     seen={}
