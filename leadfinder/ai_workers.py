@@ -158,6 +158,16 @@ class WorkerDB:
             # Sales qualification persists across worker restarts, and can be
             # reviewed when the developer takes over the lead.
             thread_columns={x['name'] for x in c.execute('PRAGMA table_info(ai_threads)')}
+            if 'retry_after' not in thread_columns:
+                c.execute('ALTER TABLE ai_threads ADD COLUMN retry_after REAL NOT NULL DEFAULT 0')
+            # Record a concise reply pipeline stage, so failure is not hidden.
+            # No message contents, Gemini keys, or phone numbers are stored here.
+            c.execute('''CREATE TABLE IF NOT EXISTS ai_reply_trace (
+                lead_id INTEGER PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
+                worker_id TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                detail TEXT NOT NULL DEFAULT '',
+                updated_at REAL NOT NULL)''')
             if 'qualification_questions' not in thread_columns:
                 c.execute('ALTER TABLE ai_threads ADD COLUMN qualification_questions INTEGER NOT NULL DEFAULT 0')
             if 'qualification_facts' not in thread_columns:
@@ -619,6 +629,9 @@ class WorkerDB:
                         c.execute('UPDATE leads SET do_not_contact=1 WHERE id=?',(lead['id'],))
             c.execute('DELETE FROM ai_unmatched WHERE worker_id=? AND chat_id=?',(worker_id,chat))
             if latest_in is not None:
+                c.execute('UPDATE ai_threads SET retry_after=0 WHERE lead_id=?',(lead['id'],))
+                self._trace_in_tx(c,lead['id'],worker_id,'received',
+                                  'WhatsApp identity verified; saved inbound recovered')
                 c.execute('''INSERT INTO ai_threads(lead_id,last_inbound) VALUES(?,?)
                     ON CONFLICT(lead_id) DO UPDATE SET last_inbound=MAX(COALESCE(last_inbound,0),excluded.last_inbound)''',
                     (lead['id'],latest_in))
@@ -627,6 +640,37 @@ class WorkerDB:
                     ON CONFLICT(lead_id) DO UPDATE SET last_outbound=MAX(COALESCE(last_outbound,0),excluded.last_outbound)''',
                     (lead['id'],latest_out))
         return lead
+
+    @staticmethod
+    def _trace_in_tx(c, lead_id, worker_id, stage, detail=''):
+        # Never persist customer text or credential-bearing API responses.
+        c.execute("""INSERT INTO ai_reply_trace(lead_id,worker_id,stage,detail,updated_at)
+            VALUES(?,?,?,?,?) ON CONFLICT(lead_id) DO UPDATE SET
+            worker_id=excluded.worker_id,stage=excluded.stage,
+            detail=excluded.detail,updated_at=excluded.updated_at""",
+            (int(lead_id),str(worker_id),str(stage)[:40],str(detail)[:150],now()))
+
+    def reply_trace(self, lead_id):
+        with self.connect() as c:
+            row=c.execute('SELECT stage,detail,updated_at FROM ai_reply_trace WHERE lead_id=?',(int(lead_id),)).fetchone()
+            return dict(row) if row else None
+
+    def set_reply_stage(self, lead_id, worker_id, stage, detail=''):
+        with self.connect(True) as c:
+            self._trace_in_tx(c,lead_id,worker_id,stage,detail)
+
+    def retry_reply(self, thread, category, delay=90):
+        """Persist bounded failure backoff without consuming the inbound turn.
+
+        A new inbound message clears the cooldown immediately.
+        """
+        with self.connect(True) as c:
+            current=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",
+                              (thread['lead_id'],)).fetchone()[0]
+            if current == thread['latest_inbound_id']:
+                c.execute('UPDATE ai_threads SET retry_after=? WHERE lead_id=?',
+                          (now()+max(20,min(600,int(delay))),thread['lead_id']))
+                self._trace_in_tx(c,thread['lead_id'],thread['worker_id'],'retry_scheduled',category)
 
     def inbound(self, worker_id, event_id, chat_id, body, sent_at=None, sender_phone=''):
         # Persist incoming events; match verified phone IDs or keep unmatched.
@@ -649,6 +693,8 @@ class WorkerDB:
             c.execute('''INSERT INTO ai_threads(lead_id,last_inbound) VALUES(?,?)
                 ON CONFLICT(lead_id) DO UPDATE SET last_inbound=excluded.last_inbound,followups_sent=0''',
                 (lead_id, when))
+            c.execute('UPDATE ai_threads SET retry_after=0 WHERE lead_id=?',(lead_id,))
+            self._trace_in_tx(c,lead_id,worker_id,'received','Incoming message matched to assigned lead')
             # Keep the one-off developer handoff confirmation until delivered.
             # A new opt-out, however, cancels even that pending confirmation.
             c.execute("""UPDATE ai_messages SET status='superseded' WHERE lead_id=?
@@ -784,10 +830,11 @@ class WorkerDB:
                 JOIN leads l ON l.id=t.lead_id AND l.archived=0
                 LEFT JOIN ai_permissions p ON p.lead_id=t.lead_id
                 WHERE t.last_inbound IS NOT NULL AND
-                  (t.in_progress=0 OR t.lease_at<?)
+                  COALESCE(t.retry_after,0)<=?
+                  AND (t.in_progress=0 OR t.lease_at<?)
                   AND t.last_inbound<=?
                   AND NOT EXISTS (SELECT 1 FROM ai_lead_control z WHERE z.lead_id=t.lead_id AND (z.paused=1 OR z.handoff=1))
-                  ORDER BY t.last_inbound LIMIT 25''', (t-180,t-2)).fetchall()
+                  ORDER BY t.last_inbound LIMIT 25''', (t,t-180,t-2)).fetchall()
             for row in rows:
                 latest=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",(row['lead_id'],)).fetchone()[0] or 0
                 if latest <= row['replied_through'] or t-row['last_inbound'] < row['batching_seconds'] or t-row['last_inbound'] > 86400:
@@ -797,6 +844,7 @@ class WorkerDB:
                 if not self._acquire_generation_in_tx(c,row['worker_id'],t):
                     continue
                 c.execute('UPDATE ai_threads SET in_progress=1,lease_at=? WHERE lead_id=?',(t,row['lead_id']))
+                self._trace_in_tx(c,row['lead_id'],row['worker_id'],'generating','Gemini decision in progress')
                 return {**dict(row),'latest_inbound_id':latest}
         return None
 
@@ -849,7 +897,8 @@ class WorkerDB:
                 VALUES(?,?,?,'out',?,'queued_reply',?,?,'handoff')''',
                 (lead_id,thread['worker_id'],recent['chat_id'],final_message,now(),now()))
             outgoing=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-            c.execute('''UPDATE ai_threads SET replied_through=?,followups_sent=1 WHERE lead_id=?''',(latest,lead_id))
+            c.execute('''UPDATE ai_threads SET replied_through=?,followups_sent=1,retry_after=0 WHERE lead_id=?''',(latest,lead_id))
+            self._trace_in_tx(c,lead_id,thread['worker_id'],'queued','Final developer handoff message queued')
             c.execute('''INSERT INTO ai_lead_control(lead_id,paused,handoff,changed_at,handoff_reason,handoff_at)
                 VALUES(?,0,1,?,?,?) ON CONFLICT(lead_id) DO UPDATE SET
                 handoff=1,changed_at=excluded.changed_at,
@@ -900,7 +949,8 @@ class WorkerDB:
             c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at)
                  VALUES(?,?,?,'out',?,'queued_reply',?,?)''',(thread['lead_id'],thread['worker_id'],latest['chat_id'],body,now(),now()))
             identifier=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-            c.execute('UPDATE ai_threads SET replied_through=? WHERE lead_id=?',(newest,thread['lead_id']))
+            c.execute('UPDATE ai_threads SET replied_through=?,retry_after=0 WHERE lead_id=?',(newest,thread['lead_id']))
+            self._trace_in_tx(c,thread['lead_id'],thread['worker_id'],'queued','Reply generated; waiting for WhatsApp send')
             self._record_qualification(c,thread['lead_id'],facts or {}, '?' in body or '؟' in body)
             return identifier
 
@@ -914,7 +964,9 @@ class WorkerDB:
             assigned = c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?', (thread['lead_id'],)).fetchone()
             if not assigned or assigned['worker_id'] != thread['worker_id'] or latest != thread['latest_inbound_id']:
                 return False
-            c.execute('UPDATE ai_threads SET replied_through=? WHERE lead_id=?', (latest, thread['lead_id']))
+            c.execute('UPDATE ai_threads SET replied_through=?,retry_after=0 WHERE lead_id=?', (latest, thread['lead_id']))
+            self._trace_in_tx(c,thread['lead_id'],thread['worker_id'],'ignored',
+                              'Gemini chose not to reply to this turn')
             return True
 
     def pending_outbound(self):
@@ -932,6 +984,13 @@ class WorkerDB:
             raise ValueError('Invalid message status')
         with self.connect(True) as c:
             c.execute('UPDATE ai_messages SET status=? WHERE id=? AND direction="out" AND status IN ("queued","queued_reply","sending")',(status,message_id))
+            record=c.execute("SELECT lead_id,worker_id FROM ai_messages WHERE id=? AND direction='out'",(message_id,)).fetchone()
+            if record and record['lead_id'] is not None:
+                latest=c.execute("SELECT kind FROM ai_messages WHERE id=?",(message_id,)).fetchone()
+                if (latest and latest['kind'] == 'handoff') or status in ('sent','uncertain','failed','blocked'):
+                    stage={'sent':'sent','uncertain':'unconfirmed','failed':'send_failed','blocked':'send_blocked'}[status]
+                    self._trace_in_tx(c,record['lead_id'],record['worker_id'],stage,
+                                      'WhatsApp send result: '+status)
             if status=='sent':
                 c.execute('UPDATE ai_threads SET last_outbound=? WHERE lead_id=(SELECT lead_id FROM ai_messages WHERE id=?)',(now(),message_id))
 

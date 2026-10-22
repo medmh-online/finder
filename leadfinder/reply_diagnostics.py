@@ -25,7 +25,8 @@ def find_leads_for_phone(db, entered: str, region: str = "MA") -> dict:
             l.archived,l.do_not_contact,a.worker_id AS assigned_worker,
             COALESCE(ctrl.paused,0) AS ai_paused,
             COALESCE(ctrl.handoff,0) AS ai_handoff,
-            thr.last_inbound,thr.replied_through,
+            thr.last_inbound,thr.replied_through,thr.retry_after,
+            trace.stage AS reply_stage,trace.detail AS reply_detail,trace.updated_at AS trace_time,
             (SELECT MAX(m.id) FROM ai_messages m WHERE m.lead_id=l.id AND m.direction='in') AS last_inbound_id,
             (SELECT m.status FROM ai_messages m WHERE m.lead_id=l.id AND m.direction='out' ORDER BY m.id DESC LIMIT 1) AS last_out_status,
             perm.opted_out_at
@@ -33,6 +34,7 @@ def find_leads_for_phone(db, entered: str, region: str = "MA") -> dict:
             LEFT JOIN ai_assignments a ON a.lead_id=l.id
             LEFT JOIN ai_lead_control ctrl ON ctrl.lead_id=l.id
             LEFT JOIN ai_threads thr ON thr.lead_id=l.id
+            LEFT JOIN ai_reply_trace trace ON trace.lead_id=l.id
             LEFT JOIN ai_permissions perm ON perm.lead_id=l.id""")
         for row in rows:
             values = {v for field in ('phone_e164','phone')
@@ -64,6 +66,8 @@ def diagnose_match(item, worker_id: str) -> list[str]:
         reasons.append('No inbound message is linked to this lead.')
     elif item['last_inbound_id'] <= (item['replied_through'] or 0):
         reasons.append('Most recent inbound was already handled or intentionally ignored.')
+    if item.get('reply_stage') in ('retry_scheduled','unconfirmed','send_failed','send_blocked'):
+        reasons.append('Reply pipeline: '+str(item['reply_stage'])+' — '+str(item.get('reply_detail') or ''))
     if item['last_out_status'] in ('queued','queued_reply','sending'):
         reasons.append('A reply is queued or sending; check gateway status.')
     if item['last_out_status'] in ('failed','uncertain','blocked'):
@@ -91,6 +95,12 @@ def render_reply_diagnostics(db, worker_id: str, live: dict) -> None:
             st.warning('No selected Gemini model/key. Configure one under Gemini keys + models.')
         if worker.get('model_name') and worker['model_name'] not in db.working_models(worker_id):
             st.warning('Selected Gemini model has no currently tested compatible key.')
+        settings=db.account_settings()
+        if db.daily_used(worker_id)>=int(settings['daily_ai_limit']):
+            st.error('Daily Gemini generation-request limit is exhausted for this worker.')
+        if not db.token_budget_available(worker_id):
+            st.error('Daily token budget is too low for another AI reply (300-token reservation). Increase the worker limit or allow UTC-day reset.')
+
         with st.form('reply_diagnostics_phone_'+worker_id):
             number = st.text_input('Phone number already entered in Leads', key='reply_diag_number_'+worker_id,
                 placeholder='+212 6 12 34 56 78')
@@ -126,6 +136,16 @@ def render_reply_diagnostics(db, worker_id: str, live: dict) -> None:
             else:
                 st.success('Lead assignment and reply state look eligible. Check whether its message reached the gateway.')
             st.caption('Latest linked inbound: ' + _date(item['last_inbound']))
+            if item.get('reply_stage'):
+                st.write('**Reply pipeline:** '+str(item['reply_stage']).replace('_',' ').title())
+                if item.get('reply_detail'):
+                    st.caption(str(item['reply_detail']))
+                st.caption('Last pipeline update: '+_date(item.get('trace_time')))
+            if item.get('retry_after') and float(item['retry_after'])>datetime.now(timezone.utc).timestamp():
+                st.info('The last AI failure is on cooldown until '+_date(item['retry_after'])+
+                        '. A new incoming message clears this cooldown.')
+            if item.get('last_inbound_id') and not item.get('reply_stage'):
+                st.info('No reply pipeline trace yet. Start the AI gateway with START.bat and send a new message.')
             if item.get('last_inbound_id') and item['last_inbound_id'] > int(item.get('replied_through') or 0):
                 if worker.get('enabled') and state == 'ready' and not item.get('ai_paused') and not item.get('ai_handoff'):
                     st.info('Inbound is stored but still awaiting an AI decision or queued reply. Check the gateway terminal for [reply] or [agent loop] errors.')
@@ -143,6 +163,7 @@ def render_reply_diagnostics(db, worker_id: str, live: dict) -> None:
         # Count by event type only; avoid exposing WhatsApp message contents.
         unmatched = db.unmatched(worker_id)
         if unmatched:
+            st.warning('Messages in this list have NOT been linked to a lead. Gemini cannot reply until WhatsApp verifies the sender identity.')
             recent = unmatched[:8]
             types = ', '.join('LID' if str(x['chat_id']).endswith('@lid') else 'phone chat'
                               for x in recent)

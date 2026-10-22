@@ -34,11 +34,14 @@ def parse_ai_decision(result):
             if action not in {'reply','ignore','stop','handoff','complete'}:action='ignore'
             body=str(value.get('reply') or '').strip()
             if bool(value.get('opt_out')):action='stop'
+            if action=='reply' and not body:
+                raise RuntimeError('Gemini produced an empty reply message')
             return action,body
     except (ValueError,TypeError):
         pass
     # Do not accidentally send a JSON-like malformed instruction or an essay.
-    if clean.startswith('{') or len(clean)>600:return 'ignore',''
+    if clean.startswith('{') or len(clean)>600:
+        raise ValueError('Gemini returned malformed or oversized reply JSON')
     return 'reply',clean
 
 
@@ -235,11 +238,22 @@ def gemini_with_fallback(db, worker, base_data, prompt, dialogue, *, purpose, le
 def answer_one(db,thread,base_data):
     worker=db.worker(thread['worker_id'])
     if not worker or not worker['enabled']:
+        db.set_reply_stage(thread['lead_id'],thread['worker_id'],'worker_disabled',
+                           'Worker AI replies disabled before generation')
         return
     settings=db.account_settings()
-    if db.daily_used(thread['worker_id'])>=settings['daily_ai_limit'] or not db.token_budget_available(thread['worker_id']):
+    if db.daily_used(thread['worker_id'])>=settings['daily_ai_limit']:
+        db.set_reply_stage(thread['lead_id'],thread['worker_id'],'daily_limit',
+                           'Daily AI generation request limit reached')
         return
-    if not worker['model_name'] or not db.working_models(worker['id']):return
+    if not db.token_budget_available(thread['worker_id']):
+        db.set_reply_stage(thread['lead_id'],thread['worker_id'],'token_limit',
+                           'Daily token limit cannot cover the next AI reply')
+        return
+    if not worker['model_name'] or worker['model_name'] not in db.working_models(worker['id']):
+        db.set_reply_stage(thread['lead_id'],thread['worker_id'],'model_unavailable',
+                           'No selected working Gemini model for this worker')
+        return
     history,messages=db.context(thread['lead_id'])
     lead=db.lead_label(thread['lead_id'])
     # Summarize older material in rolling segments, preserving factual history
@@ -295,8 +309,19 @@ def answer_one(db,thread,base_data):
     if not messages:return
     try:
         result,usage=gemini_with_fallback(db,worker,base_data,
-            instructions,human_history(messages),max_tokens=220,purpose='reply',lead_id=thread['lead_id'])
+            instructions,human_history(messages),max_tokens=768,purpose='reply',lead_id=thread['lead_id'])
         action,answer=parse_ai_decision(result)
+        # A first genuine inbound turn should not vanish as a later-chat
+        # acknowledgment. Let Gemini reconsider once; never hard-code a reply.
+        if (action=='ignore' and sum(m['direction']=='in' for m in messages)==1
+                and not any(m['direction']=='out' for m in messages)):
+            correction=(instructions + ' This is the FIRST message from this contact. '
+                       'Unless it explicitly asks to stop, respond naturally; do not return ignore.')
+            result,_=gemini_with_fallback(db,worker,base_data,correction,human_history(messages),
+                                          max_tokens=768,purpose='reply',lead_id=thread['lead_id'])
+            action,answer=parse_ai_decision(result)
+            if action=='ignore':
+                raise RuntimeError('Gemini declined to answer first inbound message')
         facts=decision_facts(result)
         action,answer=apply_verified_portfolio_answer(action,answer,messages,result,settings,lead)
         # A model can say "developer will contact you" but return action=reply.
@@ -342,7 +367,18 @@ def answer_one(db,thread,base_data):
             db.commit_reply(thread,concise_message(answer,max_chars=180),facts)
 
     except Exception as exc:
-        print('[reply]',str(exc)[:180])
+        # Never silently consume the message; avoid retrying a broken Gemini
+        # configuration every two seconds (which wastes API requests).
+        message=str(exc).casefold()
+        reason=('Gemini quota or rate limit' if '429' in message or 'quota' in message else
+                'Gemini API key/permission rejected' if any(x in message for x in ('401','403','api key','permission')) else
+                'Invalid Gemini response' if any(x in message for x in ('json','empty reply','no text')) else
+                'AI generation error ('+type(exc).__name__+')')
+        try: db.retry_reply(thread,reason,delay=120 if 'quota' in reason.casefold() else 60)
+        except Exception as record_exc:
+            print('[reply trace] '+type(record_exc).__name__+': '+str(record_exc)[:120],flush=True)
+        print('[reply]',thread['worker_id'][:8],'lead',thread['lead_id'],reason,
+              'detail:',str(exc)[:150],flush=True)
 
 
 def send_pending(db,ledger):

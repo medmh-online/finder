@@ -103,3 +103,25 @@ If a connected worker does not reply, open **AI Workers → WhatsApp browser →
 The worker AI prompt now explicitly asks Gemini to answer a **first greeting** rather than silently ignore it. This is still subject to worker readiness, safe identity matching, Gemini availability, and conversation/opt-out rules. Use a test chat and check the console for `[reply]`, `[agent]`, and `[WhatsApp identity]` errors if it remains unanswered.
 
 Offline test: `python -m unittest discover -s tests -p test_overview_date_filter.py -v`. The update does not change database schemas, saved worker keys, sessions, or customer data.
+
+
+## AI inbound reply tracing (PCC reply reliability patch)
+
+AI Workers → WhatsApp browser → **Why no AI reply?** shows the last
+reply stage for a specific assigned phone number: received, generating,
+queued, sent, ignored, retry scheduled, blocked, or unconfirmed.
+An unknown WhatsApp `@lid` sender must be verified by WhatsApp before a
+message may be matched to an assigned lead. No phone/ID guessing is used.
+
+The AI gateway now gives failed Gemini replies a short persisted backoff and
+reports a category in the diagnostic instead of silently retrying every two
+seconds. New incoming messages reset the retry backoff. Low-output or malformed
+JSON responses remain pending rather than being marked handled. A first incoming
+message incorrectly ignored by Gemini is re-evaluated once by Gemini, without
+a hard-coded customer-facing reply.
+
+For troubleshooting, confirm the worker is connected and READY, the lead is
+assigned to that worker, a tested Gemini model is selected, the daily token
+limit is available, and the message appears as **received** in the diagnostic.
+For an unmatched `@lid` message use **Retry matching unmatched WhatsApp
+identities**; only WhatsApp-confirmed mappings can be accepted.
