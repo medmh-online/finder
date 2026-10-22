@@ -6,6 +6,7 @@ import streamlit as st
 from .ai_workers import WorkerDB
 from .ai_agent import prepare_draft
 from .ai_research import cleaned_public_page
+from .reply_diagnostics import render_reply_diagnostics
 from .ai_runtime import Registry,encrypt_key,decrypt_key,test_models,node_api,app_paths
 
 
@@ -151,6 +152,7 @@ def render_workers(access,repo):
             else:st.info('Logged out');st.rerun()
         st.caption('Multiple workers can run simultaneously: each gets an independent Chrome profile, window and local debugging connection. Never pair multiple numbers in one profile.')
         st.warning('WhatsApp Web pairing can succeed even if whatsapp-web.js AI attachment fails. If status is not ready, the browser is manual only. No messages will be sent by AI. This unofficial integration may break or face restrictions.')
+        render_reply_diagnostics(db, picked, status)
     with keys:
         st.subheader('Gemini API key pool')
         key_count=len(db.keys(picked))
@@ -207,3 +209,4 @@ def render_workers(access,repo):
         else:
             st.info('Add and test Gemini keys to populate the model selector.')
         st.caption('When a key fails, the worker can use another tested key compatible with the chosen model. Google API limits may apply to the whole Google Cloud project, not to individual keys.')
+

@@ -71,3 +71,19 @@ From the project root after installing dependencies, run `cd whatsapp` then `npm
 On the **Leads** page choose **Clear all leads**, then type the exact displayed phrase (`DELETE N LEADS`). The operation includes archived and blocked leads. It deletes leads, their CRM history, AI assignments and linked conversations, while retaining search campaigns/job history, worker settings, Gemini keys, WhatsApp sessions, standalone Message Queue batches, token usage totals and the persistent installation-wide do-not-contact ledger. Historical job candidate references are cleared. Future search jobs can rediscover the same businesses.
 
 Before clearing, stop/cancel queued or active Discovery jobs and disable AI workers with assigned leads. PCC updates alone do not restore an already-cleared live database; the action creates a verified SQLite backup in the project's `backups/` directory prior to deletion. A failed transactional clear preserves the original database and keeps its backup. Back up that directory securely if you need the original lead records later. Do not remove global blocked-contact records when resetting leads.
+
+
+## Troubleshooting AI workers not replying
+
+Open **AI Workers → WhatsApp browser → Why no AI reply? · Check a lead**.
+Enter a lead phone number and its default country, then **Diagnose**. The tool checks
+local phone normalization, duplicate/conflicting records, assignment to the selected worker,
+AI enablement, model configuration, unmatched incoming events, and recent Gemini errors.
+It does not call Gemini or send messages.
+
+A lead must be explicitly assigned to the worker that receives WhatsApp messages.
+A newly assigned lead should be tested with a **new incoming message from another WhatsApp account**.
+The worker must report **ready**, not merely have a signed-in Chrome window.
+An opaque `@lid` is not a phone number; only a WhatsApp-verified mapping can associate it with a lead.
+If the message was received but remains unanswered, inspect the AI gateway console for errors.
+"I can see the lead in Leads" alone does not establish message identity or a valid worker assignment.
