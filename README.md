@@ -142,3 +142,37 @@ Run `npm run test` from the `whatsapp` directory to verify listener deduplicatio
 When the request quota is exhausted, incoming messages remain recorded and **no Gemini reply is generated**. Pending conversations show the `daily_limit` reply trace; increase the shared daily generation limit deliberately if your usage policy allows it, or wait for requests to age out of the 24-hour window. Pending messages younger than 24 hours are eligible again when quota becomes available, subject to the worker's other controls and verification. The system never bypasses a customer opt-out.
 
 To investigate on the local PC, run `RUN_AI_REPLY_DIAGNOSTICS.bat`. The report shows the number of AI generation attempts used (including errors) and the configured limit without printing customer messages, phone numbers or keys. The WhatsApp service may return HTTP 404 to a GET `/health` request because that endpoint is not supported; the diagnostic treats that as a reachable server rather than falsely claiming it is offline.
+
+## MEDMH business knowledge update — 22 October 2026
+
+The owner-approved shared catalog now covers sites vitrines, landing pages,
+e-commerce, static/editable QR menus, reservations, local stock/sales/invoicing
+software, custom business tools, automations, AI assistants, and online,
+offline or hybrid solutions. The portfolio is https://medmh.online.
+The approved *indicative* price ranges in MAD are: QR 600–1,200;
+editable QR 1,200–2,200; landing 1,000–2,000; showcase site
+1,800–3,500; reservation 3,000–5,500; e-commerce 4,500–8,000;
+local software 2,500–6,000; automation 800–3,000; AI
+2,500–6,000 plus API charges. Custom projects require a quote;
+no discounts are authorized. The developer confirms scope, timing,
+hosting/domain/API and other ongoing costs.
+
+The AI may suggest a similar WhatsApp customer-service AI assistant, but
+**only when relevant**, and should not repeat pitches. Replies follow the
+customer's language, typically natural Romanized Moroccan Darija mixed with
+everyday French, in 1–2 short sentences. It clarifies the service and one
+main requirement before recording CRM handoff, unless a human is requested.
+
+This PCC update changes only source files and adds a small source-controlled
+business catalog. On the next start, WorkerDB.initialize() applies the new
+business_name, portfolio, services, pricing and instructions **once** to
+the existing SQLite `ai_account_settings` row. Prior values are copied
+to `ai_knowledge_revisions.previous_settings_json` for audit/recovery;
+`daily_ai_limit`, workers, leads, chats, model keys and sessions are not
+changed. Future changes made via AI Workers → Shared business knowledge
+persist across subsequent restarts. Before applying, make a SQLite backup
+using Settings → Create backup. PCC may not back up `leads.db` automatically
+when its project database selection is `<none>`.
+
+Offline checks (with installed dependencies):
+`.venv\Scripts\python.exe -m unittest discover -s tests -p test_medmh_knowledge.py -v`.

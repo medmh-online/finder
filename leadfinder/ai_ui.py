@@ -29,9 +29,9 @@ def render_workers(access,repo):
         with st.form('ai_shared'):
             business=st.text_input('Business name',settings['business_name'])
             portfolio=st.text_input('Portfolio URL',settings['portfolio'])
-            services=st.text_area('Services offered (shared across every worker)',settings['services'],height=100)
-            pricing=st.text_area('Actual approved prices / negotiation limits (leave blank if none)',settings['pricing'],height=100)
-            instructions=st.text_area('Sales instructions (shared across every worker)',settings['instructions'],height=110)
+            services=st.text_area('Services offered (shared across every worker)',settings['services'],height=145)
+            pricing=st.text_area('Approved indicative prices — shared across every worker',settings['pricing'],height=150)
+            instructions=st.text_area('Sales instructions (shared across every worker)',settings['instructions'],height=230)
             limit=st.number_input('Daily generation limit per worker (not a Google quota)',min_value=1,max_value=50000,value=int(settings['daily_ai_limit']))
             if st.form_submit_button('Save business knowledge'):
                 access.require()

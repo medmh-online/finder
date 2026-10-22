@@ -14,6 +14,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from .ai_outreach import normalize_phone
+from . import business_knowledge as medmh_knowledge
 
 
 def now() -> float:
@@ -132,9 +133,7 @@ class WorkerDB:
                 portfolio TEXT NOT NULL DEFAULT 'https://medmh.online',
                 services TEXT NOT NULL DEFAULT '', pricing TEXT NOT NULL DEFAULT '',
                 instructions TEXT NOT NULL DEFAULT '', daily_ai_limit INTEGER NOT NULL DEFAULT 100);
-            INSERT OR IGNORE INTO ai_account_settings(id,services,instructions) VALUES
-                (1,'Business websites, booking systems, custom automations, and AI solutions.',
-                'Short WhatsApp replies in the customer language (Darija, Romanized Arabic, French, or English). Answer the actual question using earlier context. One topic at a time; no repeated pitch or links. Never invent facts, prices or promises. Identify as MedMH AI assistant once. Respect stop requests, but answer if the customer messages again.');
+            INSERT OR IGNORE INTO ai_account_settings(id) VALUES (1);
             ''')
             c.execute('''CREATE TABLE IF NOT EXISTS ai_lead_control (
                 lead_id INTEGER PRIMARY KEY REFERENCES leads(id) ON DELETE CASCADE,
@@ -198,6 +197,29 @@ class WorkerDB:
             columns = {x['name'] for x in c.execute('PRAGMA table_info(ai_messages)')}
             if 'kind' not in columns:
                 c.execute("ALTER TABLE ai_messages ADD COLUMN kind TEXT NOT NULL DEFAULT 'manual'")
+            # Apply the explicitly owner-approved catalog once per revision.
+            # Record the previous settings for auditing / manual rollback.
+            # Existing worker quotas, AI keys, conversation history, and leads
+            # are not touched. Subsequent dashboard edits remain persistent.
+            c.execute('''CREATE TABLE IF NOT EXISTS ai_knowledge_revisions (
+                revision TEXT PRIMARY KEY, previous_settings_json TEXT NOT NULL,
+                applied_at REAL NOT NULL)''')
+            if not c.execute('SELECT 1 FROM ai_knowledge_revisions WHERE revision=?',
+                             (medmh_knowledge.KNOWLEDGE_REVISION,)).fetchone():
+                previous = c.execute('''SELECT business_name,portfolio,services,pricing,instructions
+                                         FROM ai_account_settings WHERE id=1''').fetchone()
+                if previous is None:
+                    raise RuntimeError('Missing shared MEDMH knowledge settings')
+                c.execute('''UPDATE ai_account_settings
+                             SET business_name=?,portfolio=?,services=?,pricing=?,instructions=?
+                             WHERE id=1''', (
+                    medmh_knowledge.BUSINESS_NAME, medmh_knowledge.PORTFOLIO,
+                    medmh_knowledge.SERVICES, medmh_knowledge.PRICING,
+                    medmh_knowledge.SALES_INSTRUCTIONS))
+                c.execute('''INSERT INTO ai_knowledge_revisions
+                             (revision,previous_settings_json,applied_at) VALUES(?,?,?)''',
+                          (medmh_knowledge.KNOWLEDGE_REVISION,
+                           json.dumps(dict(previous),ensure_ascii=False),now()))
         return self
 
     @staticmethod
