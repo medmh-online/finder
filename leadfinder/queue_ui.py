@@ -15,6 +15,18 @@ def _time(ts):
     return datetime.fromtimestamp(float(ts),timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if ts else '—'
 
 
+def _display_sent_total(batch):
+    # Count an initiated WhatsApp send once even if the provider never returns
+    # a message ID. Unconfirmed sends stay 'uncertain' in SQLite so that they
+    # can never be retried automatically or mistaken for confirmed delivery.
+    return int(batch.get('sent') or 0) + int(batch.get('uncertain') or 0)
+
+
+def _display_send_status(item):
+    # Presentation only: the underlying audit record remains unchanged.
+    return 'sent (unconfirmed)' if item.get('status') == 'uncertain' else item['status']
+
+
 def render_queue(access):
     db=init_queue(WorkerDB(access.paths().database))
     st.header('Message Queue')
@@ -68,8 +80,8 @@ def render_queue(access):
         st.info('No queues prepared yet.')
         return
     summary=[{'Created':_time(b['created_at']),'Worker':b['worker_name'],
-        'State':b['state'],'Sent':b['sent'] or 0,'Pending':(b['pending'] or 0)+(b['checking'] or 0)+(b['sending'] or 0),
-        'Skipped':b['skipped'] or 0,'Uncertain':b['uncertain'] or 0,'Batch':b['id'][:10]} for b in history]
+        'State':b['state'],'Sent':_display_sent_total(b),'Pending':(b['pending'] or 0)+(b['checking'] or 0)+(b['sending'] or 0),
+        'Skipped':b['skipped'] or 0,'Batch':b['id'][:10]} for b in history]
     st.dataframe(pd.DataFrame(summary),hide_index=True,width='stretch')
     lookup={b['id']:b for b in history}
     wanted=st.session_state.get('sq_inspect')
@@ -102,9 +114,9 @@ def render_queue(access):
                 st.warning('Queue process is alive, but this batch was not polled recently. If phase is polling, it may be waiting for a WhatsApp response; check the console.')
     m=st.columns(4)
     m[0].metric('Numbers',batch['total'] or 0)
-    m[1].metric('Sent',batch['sent'] or 0)
+    m[1].metric('Sent',_display_sent_total(batch))
     m[2].metric('Waiting',(batch['pending'] or 0)+(batch['checking'] or 0)+(batch['sending'] or 0))
-    m[3].metric('Skipped / uncertain',(batch['skipped'] or 0)+(batch['uncertain'] or 0))
+    m[3].metric('Skipped',batch['skipped'] or 0)
     if batch['next_at'] and batch['state']=='running':
         remaining=max(0,int(batch['next_at']-datetime.now(timezone.utc).timestamp()))
         st.caption(f'Next recipient: {_time(batch["next_at"])} · around {remaining}s remaining')
@@ -118,31 +130,9 @@ def render_queue(access):
     st.dataframe(pd.DataFrame([{
         'Original':item['raw_number'],'Normalized':item['e164'] or '—',
         'Verified WhatsApp ID':item.get('verified_chat_id') or 'Not checked yet',
-        'Occurrence':item['occurrence'] or '—','Status':item['status'],
+        'Occurrence':item['occurrence'] or '—','Status':_display_send_status(item),
         'Detail':item['reason'],'Attempted':_time(item['attempted_at'])} for item in items]),
         hide_index=True,width='stretch')
-    # An ID-less provider response is intentionally kept uncertain even if
-    # the user can see delivery in WhatsApp. Permit explicitly recording human
-    # verification, NEVER a resend or a fabricated WhatsApp message ID.
-    uncertain=[item for item in items if item['status']=='uncertain']
-    if uncertain:
-        st.warning(f'{len(uncertain)} send(s) have no provider-confirmed message ID. Do not retry automatically.')
-        ids=[int(item['id']) for item in uncertain]
-        selected_id=st.selectbox('Review an uncertain send',ids,
-            format_func=lambda iid:next((f"Item {iid} · {x['raw_number']} · {x['reason']}" for x in uncertain if int(x['id'])==iid),str(iid)),
-            key='sq_uncertain_item_'+batch_id)
-        reviewed=st.checkbox('I checked this exact conversation in WhatsApp and saw the outgoing message.',
-            key='sq_confirm_manual_'+batch_id+'_'+str(selected_id))
-        if st.button('Record delivery verified manually (do not send again)',
-                     key='sq_manual_confirm_'+batch_id,disabled=not reviewed):
-            with db.connect(True) as c:
-                updated=c.execute("UPDATE standalone_message_items SET status='sent',reason='Manually confirmed in WhatsApp (no provider message ID)',updated_at=? WHERE id=? AND batch_id=? AND status='uncertain'",
-                       (time.time(),selected_id,batch_id)).rowcount
-            if updated:
-                st.success('Manual confirmation recorded. No WhatsApp message was sent by this action.')
-                st.rerun()
-            else:
-                st.error('This record changed since it was displayed. Refresh the queue.')
     duplicates=sum(1 for item in items if item['occurrence']>1)
     if duplicates:st.warning(f'{duplicates} repeated number(s) detected; they remain separate entries, as in your original sender.')
-    st.caption('Pause/resume is persistent. Uncertain deliveries require manual review and are never automatically resent. WhatsApp registration is checked before each send.')
+    st.caption('Sent includes attempted sends without a confirmed WhatsApp message ID. They are not proof of delivery and are never retried automatically. WhatsApp registration is checked before each send.')
