@@ -1,138 +1,136 @@
-"""Standalone WhatsApp number-list queue; no CRM leads are created or modified."""
+"""Send-only WhatsApp queue UI: current job only, no sent-message history."""
 from __future__ import annotations
-from datetime import datetime,timezone
+
+from datetime import datetime, timezone
 import json
 import time
-import pandas as pd
+
 import streamlit as st
+
 from .ai_workers import WorkerDB
-from .ai_outreach import GlobalContactLedger
-from .message_queue import init_queue,prepare,batches,entries,control,queue_contacts_today,register_queue_worker
-from .ai_runtime import app_paths,node_api
+from .message_queue import (
+    active_batch, control, init_queue, prepare, queue_contacts_today,
+    register_queue_worker,
+)
+from .ai_runtime import node_api
 
 
 def _time(ts):
-    return datetime.fromtimestamp(float(ts),timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if ts else '—'
+    return datetime.fromtimestamp(float(ts), timezone.utc).strftime('%Y-%m-%d %H:%M UTC') if ts else '—'
 
 
-def _display_sent_total(batch):
-    # Count an initiated WhatsApp send once even if the provider never returns
-    # a message ID. Unconfirmed sends stay 'uncertain' in SQLite so that they
-    # can never be retried automatically or mistaken for confirmed delivery.
-    return int(batch.get('sent') or 0) + int(batch.get('uncertain') or 0)
-
-
-def _display_send_status(item):
-    # Presentation only: the underlying audit record remains unchanged.
-    return 'sent (unconfirmed)' if item.get('status') == 'uncertain' else item['status']
+@st.fragment(run_every=3.0)
+def _current_send(access, worker_id):
+    """Progress for the only active queue; no history, recipient log, or selector."""
+    db = init_queue(WorkerDB(access.paths().database))
+    current = active_batch(db, worker_id, st.session_state.get('sq_active_batch'))
+    if not current:
+        if st.session_state.pop('sq_active_batch', None):
+            st.toast('Queue finished or cancelled. No send history is retained.')
+            st.rerun()  # Refresh the main form so another send can be started.
+        return
+    st.session_state['sq_active_batch'] = current['id']
+    st.subheader('Current sending')
+    if current['state'] == 'paused':
+        st.info('Sending is paused. Resume this batch or cancel it before starting a new one.')
+    if current['state'] == 'running':
+        status_path = access.paths().data / 'queue_dispatcher_status.json'
+        try:
+            dispatcher = json.loads(status_path.read_text(encoding='utf-8'))
+        except (OSError, ValueError):
+            dispatcher = {}
+        age = time.time() - float(dispatcher.get('heartbeat_at') or 0)
+        if dispatcher.get('db_path') and dispatcher['db_path'] != str(access.paths().database.resolve()):
+            st.error('Queue dispatcher uses a different database. Check the START.bat console.')
+        elif not dispatcher.get('heartbeat_at') or age > 20:
+            st.error('Queue dispatcher is not responding. Check the START.bat console.')
+        elif dispatcher.get('last_error'):
+            st.error('Queue dispatcher: ' + str(dispatcher['last_error'])[:200])
+    counts = st.columns(4)
+    counts[0].metric('Numbers', current['total'] or 0)
+    # An attempted send without a WhatsApp ID is not proof of delivery.
+    counts[1].metric('Sent / attempted', int(current['sent'] or 0) + int(current['uncertain'] or 0))
+    counts[2].metric('Waiting', sum(int(current[x] or 0) for x in ('pending','checking','sending')))
+    counts[3].metric('Skipped', current['skipped'] or 0)
+    if current['state'] == 'running' and current['next_at']:
+        remaining = max(0, int(current['next_at'] - time.time()))
+        st.caption(f'Next recipient: {_time(current["next_at"])} · about {remaining}s remaining')
+    a,b,c = st.columns(3)
+    if a.button('Pause', disabled=current['state']!='running', key='sq_pause', width='stretch'):
+        try:
+            control(db,current['id'],'pause')
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if b.button('Resume', disabled=current['state']!='paused', key='sq_resume', width='stretch'):
+        try:
+            control(db,current['id'],'resume')
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if c.button('Cancel', key='sq_cancel', width='stretch'):
+        try:
+            control(db,current['id'],'cancel')
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    st.caption('Only the active batch is kept temporarily for delays and safe recovery. Completed batches are deleted automatically. Unconfirmed attempts are not retried.')
 
 
 def render_queue(access):
-    db=init_queue(WorkerDB(access.paths().database))
+    db = init_queue(WorkerDB(access.paths().database))
     st.header('Message Queue')
-    st.caption('Standalone number lists · no Leads or CRM records · local number normalization')
-    workers=db.workers()
+    st.caption('Send numbers through WhatsApp · no saved batch history · local number normalization')
+    workers = db.workers()
     if not workers:
         st.info('Create a WhatsApp worker in AI Workers first.')
         return
-    selected=st.selectbox('Send from worker',[w['id'] for w in workers],
+    selected = st.selectbox('Send from worker', [w['id'] for w in workers],
          format_func=lambda wid:next(w['name'] for w in workers if w['id']==wid),key='sq_worker')
-    worker=db.worker(selected)
-    # A manually created queue worker may never have visited the AI Workers page.
+    worker = db.worker(selected)
     try:
         register_queue_worker(selected)
     except Exception as exc:
-        st.error('Queue background registration failed: '+str(exc)[:180])
-    try:live=node_api('/status',{'workerId':selected},timeout=3)
-    except Exception:live={}
-    metrics=st.columns(3)
+        st.error('Queue background registration failed: ' + str(exc)[:180])
+    try:
+        live = node_api('/status',{'workerId':selected},timeout=3)
+    except Exception:
+        live = {}
+    metrics = st.columns(2)
     metrics[0].metric('WhatsApp',live.get('state','offline'))
-    metrics[1].metric('New contacts today',f"{db.daily_new_contact_used(selected)+queue_contacts_today(db,selected)} / {worker['daily_new_contacts']}")
-    tokens=db.tokens_today(selected)
-    metrics[2].metric('Gemini tokens today',f"{tokens['total']:,} / {worker['daily_token_limit']:,}")
-    if live.get('state')!='ready':
-        st.warning('WhatsApp is not READY. Prepare the queue now; sending begins only after this worker connects.')
+    metrics[1].metric('Contacts attempted today',
+        f"{db.daily_new_contact_used(selected) + queue_contacts_today(db,selected)} / {worker['daily_new_contacts']}")
+    current = active_batch(db,selected,st.session_state.get('sq_active_batch'))
+    ready = live.get('state')=='ready'
+    if not ready:
+        st.warning('WhatsApp is not READY. Connect the worker before sending.')
     with st.container(border=True):
-        st.subheader('Prepare numbers')
-        numbers=st.text_area('Numbers · one per line, comma or semicolon',height=135,
+        st.subheader('Send message')
+        numbers = st.text_area('Numbers · one per line, comma or semicolon',height=135,
             placeholder='06 12 34 56 78\n00212 6 98 76 54 32\n+212 6 61 23 45 67',key='sq_numbers')
-        country=st.selectbox('Default number country',['MA','FR','BE','ES','GB','US','DZ','TN'],key='sq_country')
-        st.caption('Phone numbers are normalized and validated locally (no Gemini tokens). Invalid or ambiguous numbers are skipped. Original order is preserved.')
-        msg=st.text_area('Message · sent exactly as written',height=95,key='sq_message',
-            placeholder='Type the message to send unchanged to each valid number.')
-        a,b=st.columns(2)
-        lo=a.number_input('Minimum gap between sends (seconds)',1,3600,5,key='sq_min')
-        hi=b.number_input('Maximum gap between sends (seconds)',1,3600,30,key='sq_max')
-        if st.button('Normalize numbers locally & preview',type='primary',key='sq_prepare'):
+        country = st.selectbox('Default number country',['MA','FR','BE','ES','GB','US','DZ','TN'],key='sq_country')
+        message = st.text_area('Message',height=95,key='sq_message',
+            placeholder='Type the message to send exactly as written.')
+        a,b = st.columns(2)
+        lo = a.number_input('Minimum delay between numbers (seconds)',1,3600,5,key='sq_min')
+        hi = b.number_input('Maximum delay between numbers (seconds)',1,3600,30,key='sq_max')
+        if st.button('Send messages',type='primary',key='sq_send',width='stretch',
+                     disabled=bool(current) or not ready):
+            batch_id = None
             try:
-                batch=prepare(db,selected,numbers,msg,country,lo,hi)
-                st.session_state['sq_inspect']=batch
-                st.success('Saved number preview. Review below, then Start.')
+                batch_id = prepare(db,selected,numbers,message,country,lo,hi)
+                control(db,batch_id,'start')
+                st.session_state['sq_active_batch'] = batch_id
+                st.success('Sending started.')
                 st.rerun()
-            except Exception as exc:st.error(str(exc)[:400])
-    st.caption('This page does not add leads or require CRM permission records. Use it for recipients you are authorized to message. Existing do-not-contact requests are still respected.')
-    history=batches(db,50)
-    top=st.columns([4,1])
-    top[0].subheader('Queue monitoring')
-    if top[1].button('Refresh queue',key='sq_refresh',width='stretch'):
-        st.rerun()
-    if not history:
-        st.info('No queues prepared yet.')
-        return
-    summary=[{'Created':_time(b['created_at']),'Worker':b['worker_name'],
-        'State':b['state'],'Sent':_display_sent_total(b),'Pending':(b['pending'] or 0)+(b['checking'] or 0)+(b['sending'] or 0),
-        'Skipped':b['skipped'] or 0,'Batch':b['id'][:10]} for b in history]
-    st.dataframe(pd.DataFrame(summary),hide_index=True,width='stretch')
-    lookup={b['id']:b for b in history}
-    wanted=st.session_state.get('sq_inspect')
-    if wanted not in lookup:wanted=history[0]['id']
-    batch_id=st.selectbox('Inspect batch',list(lookup),index=list(lookup).index(wanted),
-        format_func=lambda key:f"{_time(lookup[key]['created_at'])} · {lookup[key]['worker_name']} · {lookup[key]['state']} · {key[:8]}",key='sq_inspect')
-    batch=lookup[batch_id]
-    if batch['state']=='running':
-        # Read the dedicated queue process heartbeat, not the AI server port.
-        # The AI gateway can be healthy even if its queue dispatcher is down.
-        status_path=access.paths().data/'queue_dispatcher_status.json'
-        try:
-            dispatcher=json.loads(status_path.read_text(encoding='utf-8'))
-        except (OSError,ValueError):
-            dispatcher={}
-        heartbeat=float(dispatcher.get('heartbeat_at') or 0)
-        age=time.time()-heartbeat if heartbeat else None
-        if dispatcher.get('db_path') and dispatcher['db_path']!=str(access.paths().database.resolve()):
-            st.error('Queue dispatcher is using a DIFFERENT database. Check the console paths. No queue sends can happen until these match.')
-        elif not heartbeat or age>20:
-            st.error('Independent queue process is NOT reporting. Check the START.bat window for [queue dispatcher] messages; it should show a PID and database path.')
-        elif dispatcher.get('last_error'):
-            st.error('Queue dispatcher error: '+str(dispatcher['last_error'])[:250])
-        else:
-            phase=dispatcher.get('phase','unknown')
-            st.caption(f'Queue process alive · PID {dispatcher.get("pid", "?")} · {phase} · heartbeat {int(max(0,age))}s ago')
-            checked=float(batch.get('last_polled_at') or 0)
-            polled_age=time.time()-checked if checked else None
-            if polled_age is None or polled_age>20:
-                st.warning('Queue process is alive, but this batch was not polled recently. If phase is polling, it may be waiting for a WhatsApp response; check the console.')
-    m=st.columns(4)
-    m[0].metric('Numbers',batch['total'] or 0)
-    m[1].metric('Sent',_display_sent_total(batch))
-    m[2].metric('Waiting',(batch['pending'] or 0)+(batch['checking'] or 0)+(batch['sending'] or 0))
-    m[3].metric('Skipped',batch['skipped'] or 0)
-    if batch['next_at'] and batch['state']=='running':
-        remaining=max(0,int(batch['next_at']-datetime.now(timezone.utc).timestamp()))
-        st.caption(f'Next recipient: {_time(batch["next_at"])} · around {remaining}s remaining')
-    cols=st.columns(4)
-    for col,label,action in zip(cols,['Start','Pause','Resume','Cancel'],['start','pause','resume','cancel']):
-        possible=(action in ('start','resume') and batch['state']=='paused') or (action in ('pause','cancel') and batch['state']=='running')
-        if col.button(label,key='sq_'+action,disabled=not possible,width='stretch'):
-            try:control(db,batch_id,action);st.rerun()
-            except Exception as exc:st.error(str(exc))
-    items=entries(db,batch_id)
-    st.dataframe(pd.DataFrame([{
-        'Original':item['raw_number'],'Normalized':item['e164'] or '—',
-        'Verified WhatsApp ID':item.get('verified_chat_id') or 'Not checked yet',
-        'Occurrence':item['occurrence'] or '—','Status':_display_send_status(item),
-        'Detail':item['reason'],'Attempted':_time(item['attempted_at'])} for item in items]),
-        hide_index=True,width='stretch')
-    duplicates=sum(1 for item in items if item['occurrence']>1)
-    if duplicates:st.warning(f'{duplicates} repeated number(s) detected; they remain separate entries, as in your original sender.')
-    st.caption('Sent includes attempted sends without a confirmed WhatsApp message ID. They are not proof of delivery and are never retried automatically. WhatsApp registration is checked before each send.')
+            except Exception as exc:
+                # If preparing succeeded but start failed, cancel the unsent
+                # batch so it never lingers as an accidental send job.
+                if batch_id:
+                    try:control(db,batch_id,'cancel')
+                    except Exception:pass
+                st.error(str(exc)[:400])
+        if current:
+            st.caption('Finish or cancel the current send before starting another.')
+    st.caption('Use only for recipients you are authorized to contact. Existing do-not-contact requests remain enforced.')
+    _current_send(access,selected)

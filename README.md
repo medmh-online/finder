@@ -9,18 +9,22 @@ This is a complete clean project, **not a patch**. It combines the v3.9 Message 
 3. Double-click **START.bat**. Keep that window open.
 4. Open **http://127.0.0.1:8502** (local-only dashboard, no login).
 5. Go to **AI Workers**. Create a worker, enter Gemini API keys (one per line), test/select a working model, open the worker's Chrome window, sign in to WhatsApp and attach AI. Only status **ready** can send.
-6. Go to **Message Queue**, choose that worker, paste your numbers, type the message, and choose a country. Click **Normalize numbers locally & preview**. Review the prepared batch, then click **Start**.
+6. Go to **Message Queue**, choose the connected worker, enter authorized recipient numbers and a message, set the send interval, and click **Send messages**. Only the active batch appears while sending.
 
-## Standalone Message Queue
+## Standalone Message Queue — send-only mode
 
-- **No Leads or CRM records are created.** Number lists and sent history are saved separately in SQLite.
-- The queue uses the installed `phonenumbers` Python library to **normalize numbers locally without any Gemini call**. Your outgoing message remains unchanged. The worker's Gemini model remains relevant for AI conversation replies, not for preparing the queue.
-- Original numbers, validated international numbers, and WhatsApp's **verified chat ID** are displayed. The ID is not guessed: after lookup it may be `212...@c.us` or an opaque `...@lid`.
-- The WhatsApp worker must be **ready**. The number is checked for registration through its existing WhatsApp Web connection before sending.
-- Each worker sends **one message at a time**, sharing its sending slot with AI replies. The next recipient uses the configured random interval; worker daily limits also apply.
-- Queue controls: **Start, Pause, Resume, Cancel**. The independent `queue_runner.py` process saves its heartbeat, PID, database path and errors to a local status file.
-- In-flight/uncertain sends are **never automatically resent** after failure. Repeated numbers are shown and retained as distinct entries—inspect them carefully before starting.
-- Global **do-not-contact** requests are still respected. Public availability of a number alone is not permission for automated marketing; use this feature for recipients you're authorized to message.
+- Message Queue is **not a CRM** and does not create Leads or store a completed batch history. The old **Queue monitoring** table, batch selector, manual delivery review, and saved recipient-history table in the dashboard have been removed.
+- Choose a **ready** WhatsApp worker, enter recipients and a message, select country and random interval, then click **Send messages**. Phone normalization is local using `phonenumbers`; it does not call Gemini. Messages are sent sequentially, with the chosen random delay **between recipients**, sharing a send slot with AI replies.
+- The page shows **only the current send**, with aggregate progress, Pause / Resume / Cancel, and a queue-runner health warning when needed. There is no completed-batch or recipient log to browse.
+- Numbers and message content are stored **temporarily in SQLite while an active/paused batch is being processed**. This is necessary for configurable delays, restart-safe progress and preventing automatic repeats after uncertain outcomes. The app automatically deletes completed/cancelled batches and their recipient rows; unused paused previews expire after 24 hours. A cancelled in-flight send is kept until it resolves or is marked uncertain so it is never resent automatically.
+- When first started after this update, the queue also deletes previously saved completed/cancelled batch history. This is intentional and cannot be undone through the UI; back up your database beforehand if you want to keep those older records outside MedMH.
+- To keep daily safety limits correct after removing recipient rows, the application retains **only short-lived anonymous per-worker/day attempt counters** in `standalone_queue_daily_usage`. These contain no phone numbers, message bodies, or WhatsApp chat IDs. All-time send histories are not retained. The global do-not-contact ledger and other AI/CRM data are unchanged.
+- The batch data may still be present in pre-existing database backups, SQLite WAL files or other system backups; removing the saved history in MedMH does not erase copies outside the live queue tables. The current batch is not stored only in browser memory.
+- Only WhatsApp-verified IDs (`@c.us` or provider-confirmed `@lid`) are used for sends. Unconfirmed attempts are **not retried automatically**, and WhatsApp registration does not imply consent. Send only to recipients you are authorized to message.
+
+### Send-only queue regression checks
+
+Run `python -m unittest discover -s tests -p test_send_only_queue.py -v` to test cleanup and daily limits without contacting WhatsApp. A successful Python syntax check alone does not verify actual delivery.
 
 
 ## Phone matching and AI usage
@@ -37,9 +41,9 @@ After installing the project dependencies, run `python -m unittest discover -s t
 ## Diagnostic notes
 
 - `Unsupported WhatsApp ID`: the original queue rejected WhatsApp's `@lid` IDs. This version accepts `@lid` only when returned by the verified number lookup, and still rejects mismatched `@c.us` phone numbers.
-- If queue stays pending, check that worker is **ready**, the queue is running, and the dashboard's dispatcher heartbeat/PID and per-recipient **Detail** fields.
+- If an active send remains waiting, verify that the worker is **ready** and read the current-send dispatcher warning and START.bat console. Completed recipient-level detail is not saved.
 - Old `.venv` failures: this installer verifies installed Python and prefers binary wheels instead of trying to compile pandas. Windows Node.js version checking does not use nested JavaScript quoting.
-- Closing **START.bat** stops the helper services; the dashboard can retain historical queue records but cannot send without them.
+- Closing **START.bat** stops helper services. An active queue remains temporarily stored for safe resume, but completed queue history is removed.
 
 ## Data safety
 
@@ -68,7 +72,7 @@ From the project root after installing dependencies, run `cd whatsapp` then `npm
 
 ## Clearing all leads (local dashboard)
 
-On the **Leads** page choose **Clear all leads**, then type the exact displayed phrase (`DELETE N LEADS`). The operation includes archived and blocked leads. It deletes leads, their CRM history, AI assignments and linked conversations, while retaining search campaigns/job history, worker settings, Gemini keys, WhatsApp sessions, standalone Message Queue batches, token usage totals and the persistent installation-wide do-not-contact ledger. Historical job candidate references are cleared. Future search jobs can rediscover the same businesses.
+On the **Leads** page choose **Clear all leads**, then type the exact displayed phrase (`DELETE N LEADS`). The operation includes archived and blocked leads. It deletes leads, their CRM history, AI assignments and linked conversations, while retaining search campaigns/job history, worker settings, Gemini keys, WhatsApp sessions, active standalone Message Queue batches (finished history is purged), token usage totals and the persistent installation-wide do-not-contact ledger. Historical job candidate references are cleared. Future search jobs can rediscover the same businesses.
 
 Before clearing, stop/cancel queued or active Discovery jobs and disable AI workers with assigned leads. PCC updates alone do not restore an already-cleared live database; the action creates a verified SQLite backup in the project's `backups/` directory prior to deletion. A failed transactional clear preserves the original database and keeps its backup. Back up that directory securely if you need the original lead records later. Do not remove global blocked-contact records when resetting leads.
 

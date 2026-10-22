@@ -75,7 +75,54 @@ def init_queue(db):
                   ON standalone_message_items(batch_id,status,id)''')
         c.execute('''CREATE INDEX IF NOT EXISTS standalone_batches_worker
                   ON standalone_message_batches(worker_id,state,created_at)''')
+        # Only anonymous daily totals survive a completed number-list send.
+        # These totals preserve rate limits after raw recipients/messages vanish.
+        c.execute('''CREATE TABLE IF NOT EXISTS standalone_queue_daily_usage(
+            worker_id TEXT NOT NULL,
+            utc_day INTEGER NOT NULL,
+            attempted_count INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(worker_id, utc_day))''')
+        _prune_history(c, time.time())
     return db
+
+
+
+def _prune_history(c, t):
+    # Drop terminal batches; never discard in-flight operations.
+    # Transfer anonymized daily counters atomically with deletion.
+    utc_day = int(t // 86400)
+    stale_preview_before = t - 86400
+    batch_ids = [r['id'] for r in c.execute('''
+        SELECT b.id FROM standalone_message_batches b
+        WHERE (b.state IN ('completed','cancelled')
+               OR (b.state='paused' AND b.created_at<?))
+          AND NOT EXISTS (
+            SELECT 1 FROM standalone_message_items i
+            WHERE i.batch_id=b.id AND i.status IN ('checking','sending')
+          )
+        ORDER BY b.created_at LIMIT 200
+        ''', (stale_preview_before,)).fetchall()]
+    if batch_ids:
+        marks = ','.join('?' for _ in batch_ids)
+        # Count only attempts that were still charged under the previous
+        # implementation. Never store numbers or message bodies in this ledger.
+        for r in c.execute(f'''
+            SELECT b.worker_id, CAST(i.attempted_at / 86400 AS INTEGER) AS utc_day,
+                   COUNT(*) AS attempts
+            FROM standalone_message_items i
+            JOIN standalone_message_batches b ON b.id=i.batch_id
+            WHERE b.id IN ({marks}) AND i.attempted_at IS NOT NULL
+              AND i.status IN ('sending','sent','uncertain')
+            GROUP BY b.worker_id, CAST(i.attempted_at / 86400 AS INTEGER)
+            ''', batch_ids).fetchall():
+            c.execute('''INSERT INTO standalone_queue_daily_usage
+                         (worker_id,utc_day,attempted_count) VALUES(?,?,?)
+                         ON CONFLICT(worker_id,utc_day) DO UPDATE SET
+                         attempted_count=attempted_count+excluded.attempted_count''',
+                      (r['worker_id'], r['utc_day'], r['attempts']))
+        c.execute(f'DELETE FROM standalone_message_batches WHERE id IN ({marks})', batch_ids)
+    # Only the current and immediately previous UTC days need a counter.
+    c.execute('DELETE FROM standalone_queue_daily_usage WHERE utc_day<?',(utc_day-1,))
 
 
 def register_queue_worker(worker_id):
@@ -100,6 +147,10 @@ def prepare(db,worker_id,raw_numbers,message,country='MA',min_gap=5,max_gap=30):
     # Register standalone-only workers too: no Leads page visit is required.
     register_queue_worker(worker_id)
     with db.connect(True) as c:
+        if c.execute('''SELECT 1 FROM standalone_message_batches
+                        WHERE worker_id=? AND state IN ('running','paused') LIMIT 1''',
+                     (worker_id,)).fetchone():
+            raise ValueError('Finish or cancel the current queue before starting a new one.')
         c.execute('''INSERT INTO standalone_message_batches
                   (id,worker_id,message,state,country,min_gap,max_gap,created_at,updated_at)
                   VALUES(?,?,?,'paused',?,?,?,?,?)''',
@@ -115,10 +166,11 @@ def prepare(db,worker_id,raw_numbers,message,country='MA',min_gap=5,max_gap=30):
     return batch_id
 
 
-def batches(db,limit=50):
+def active_batch(db, worker_id, preferred_id=None):
+    # Only the current send is visible; never enumerate historical batches.
     init_queue(db)
     with db.connect() as c:
-        return [dict(r) for r in c.execute('''SELECT b.*,w.name worker_name,
+        rows = [dict(r) for r in c.execute('''SELECT b.*,
             COUNT(i.id) total,
             SUM(i.status='pending') pending,
             SUM(i.status='checking') checking,
@@ -127,15 +179,13 @@ def batches(db,limit=50):
             SUM(i.status='skipped') skipped,
             SUM(i.status='uncertain') uncertain,
             SUM(i.status='cancelled') cancelled
-            FROM standalone_message_batches b JOIN ai_workers w ON w.id=b.worker_id
+            FROM standalone_message_batches b
             LEFT JOIN standalone_message_items i ON i.batch_id=b.id
-            GROUP BY b.id ORDER BY b.created_at DESC LIMIT ?''',(int(limit),))]
-
-
-def entries(db,batch_id):
-    with db.connect() as c:
-        return [dict(r) for r in c.execute('''SELECT * FROM standalone_message_items
-            WHERE batch_id=? ORDER BY id''',(batch_id,))]
+            WHERE b.worker_id=? AND b.state IN ('running','paused')
+            GROUP BY b.id
+            ORDER BY (b.id=?) DESC, (b.state='running') DESC, b.created_at DESC
+            LIMIT 1''',(worker_id,str(preferred_id or '')))]
+    return rows[0] if rows else None
 
 
 def control(db,batch_id,action):
@@ -189,10 +239,15 @@ def _start_of_utc_day(timestamp):
 
 
 def _used_today(c,worker_id,t):
-    return int(c.execute('''SELECT COUNT(*) FROM standalone_message_items i
+    day = int(t // 86400)
+    archived = c.execute('''SELECT attempted_count FROM standalone_queue_daily_usage
+         WHERE worker_id=? AND utc_day=?''',(worker_id,day)).fetchone()
+    current = c.execute('''SELECT COUNT(*) FROM standalone_message_items i
         JOIN standalone_message_batches b ON b.id=i.batch_id
-        WHERE b.worker_id=? AND i.attempted_at>=? AND i.status IN ('sending','sent','uncertain')''',
-        (worker_id,_start_of_utc_day(t))).fetchone()[0])
+        WHERE b.worker_id=? AND i.attempted_at>=?
+          AND i.status IN ('sending','sent','uncertain')''',
+        (worker_id,_start_of_utc_day(t))).fetchone()[0]
+    return int(current)+int(archived['attempted_count'] if archived else 0)
 
 
 def queue_contacts_today(db,worker_id):
@@ -226,7 +281,7 @@ def tick(db,ledger):
         # Heartbeat distinguishes a missing dispatcher from a WhatsApp send failure.
         c.execute("UPDATE standalone_message_batches SET last_polled_at=? WHERE state='running'",(t,))
         # Crash recovery: never silently repeat an in-flight send.
-        c.execute("UPDATE standalone_message_items SET status='uncertain',reason='Interrupted send: review manually',updated_at=? WHERE status='sending' AND attempted_at<?",(t,t-180))
+        c.execute("UPDATE standalone_message_items SET status='uncertain',reason='Interrupted send: delivery unconfirmed; do not retry',updated_at=? WHERE status='sending' AND attempted_at<?",(t,t-180))
         c.execute("UPDATE standalone_message_items SET status='pending' WHERE status='checking' AND updated_at<?",(t-120,))
         for rec in c.execute("SELECT DISTINCT worker_id FROM standalone_message_batches WHERE state='running' ORDER BY worker_id").fetchall():
             wid=rec['worker_id']
