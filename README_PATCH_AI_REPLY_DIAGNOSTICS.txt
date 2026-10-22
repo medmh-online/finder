@@ -1,33 +1,29 @@
-MedMH v3.9.1 — Reply Diagnostics (PCC patch)
+MedMH v3.9.1 — READ-ONLY AI REPLY ROOT-CAUSE DIAGNOSTICS
 
 WHAT CHANGED
-- Adds optional 'Why no AI reply?' check to the existing AI Workers / WhatsApp browser tab.
-- Finds lead by normalized number without Gemini calls and explains missing assignments, duplicate/conflicting phone fields, disabled/handoff state, missing linked inbound, and key/connection state.
-- Offers explicit one-click worker assignment only for a unique unassigned lead.
-- Displays unmatched message counts and safe Gemini error categories.
+- Added tools/diagnose_ai_replies.py: read-only check of the current live SQLite database, worker registry, localhost gateway health and WhatsApp event backlog.
+- Added RUN_AI_REPLY_DIAGNOSTICS.bat: double-click runner using the app's existing .venv Python.
+- Does not modify app.py, ai_server.py, the sending queue, any settings, or any databases.
+- Does not call Gemini, send WhatsApp messages, or print phone numbers, chat contents or API keys.
 
-WHAT DID NOT CHANGE
-- No changes to automated message delivery, matching permissions, safety rules, WhatsApp sessions, databases, queues, or secrets.
-- Does not guess opaque LID identities, resend, or contact anyone automatically.
+AFTER APPLYING IN PCC
+1. Keep MedMH running, so its local services can be tested.
+2. Double-click RUN_AI_REPLY_DIAGNOSTICS.bat in your MedMH project folder.
+3. Copy its output into ChatGPT. You may alternatively run RUN_AI_REPLY_DIAGNOSTICS.bat --lead 50 to focus on lead #50.
+4. If your affected lead has a different ID, use --lead YOUR_ID.
 
-FILES
-leadfinder/ai_ui.py
-leadfinder/reply_diagnostics.py
-README.md
+NOTE
+- The report displays partial worker IDs, lead IDs, timestamps and status flags. Inspect before sharing if you consider these private.
+- It reads the SQLite file using SQLite mode=ro. It does not mutate runtime state.
+- This is a diagnostic patch, not an unverified fix to messaging behavior.
 
-DATABASE
-No migrations; read-only inspection and an existing explicit worker assignment command.
+FILES INCLUDED
+- tools/diagnose_ai_replies.py
+- RUN_AI_REPLY_DIAGNOSTICS.bat
+- README_PATCH_AI_REPLY_DIAGNOSTICS.txt
 
-COMMANDS
-python -m compileall -q leadfinder
-
-TESTS
-1. Restart MedMH using START.bat and go to http://127.0.0.1:8502 → AI Workers.
-2. Choose your connected WhatsApp worker. Confirm state ready and enabled replies.
-3. Open WhatsApp browser tab → Why no AI reply? and enter your saved lead number.
-4. If unassigned, explicitly assign it. Send a NEW message from another account.
-5. Check that the inbound message appears in Leads/AI monitor and Gemini replies.
-6. If unmatched @lid, inspect WhatsApp identity logs; do not guess the ID.
-
-ROLLBACK
-Restore previous leadfinder/ai_ui.py and README.md; remove the new reply_diagnostics.py. No database rollback required.
+FILES DELETED: none
+COMMANDS: none
+PERSISTENT COMMANDS: none
+DATABASE CHANGES: none
+ROLLBACK: Remove only the two installed diagnostic scripts if no longer needed.
