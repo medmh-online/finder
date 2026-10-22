@@ -1,0 +1,21 @@
+# Do not commit keys, phone sessions, conversation data or installed packages.
+ai_bridge_token.secret
+ai_encryption.key
+ai_worker_registry.sqlite3
+ai_worker_registry.sqlite3-*
+*.env
+whatsapp/node_modules/
+whatsapp/sessions/
+whatsapp/event_queue/
+__pycache__/
+.pytest_cache/
+*.pyc
+
+# Global shared outbound register and safe first-run data
+ai_global_contacts.sqlite3*
+ai_contact_hmac.key
+leads.db*
+config.json
+logs/
+backups/
+whatsapp/compat/backups/

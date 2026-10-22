@@ -1,0 +1,10 @@
+streamlit>=1.41,<2
+pandas>=2.2,<3
+playwright>=1.49,<2
+phonenumbers>=8.13,<10
+tldextract>=5.1,<6
+pycountry>=24.6,<27
+tzdata>=2024.1
+packaging>=23.2
+
+cryptography>=42,<47

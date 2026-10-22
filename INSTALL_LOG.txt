@@ -1,0 +1,66 @@
+﻿**********************
+Début de la transcription Windows PowerShell
+Heure de début : 20261021215918
+Nom d'utilisateur : MED\pc
+Utilisateur runAs :  MED\pc
+Nom de la configuration : 
+Ordinateur : MED (Microsoft Windows NT 10.0.26200.0)
+Application hôte : powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\Users\pc\Downloads\MedMH_AI_Workforce_v3_9_1_Full_Consolidated_Windows\MedMH_AI_Workforce_v3_9_1\tools\install_windows.ps1
+ID de processus : 12752
+PSVersion: 5.1.26100.9711
+PSEdition: Desktop
+PSCompatibleVersions: 1.0, 2.0, 3.0, 4.0, 5.0, 5.1.26100.9711
+BuildVersion: 10.0.26100.9711
+CLRVersion: 4.0.30319.42000
+WSManStackVersion: 3.0
+PSRemotingProtocolVersion: 2.3
+SerializationVersion: 1.1.0.1
+**********************
+============================================
+ MedMH AI Workforce v3.9.1 - Install
+============================================
+Project: C:\Users\pc\Downloads\MedMH_AI_Workforce_v3_9_1_Full_Consolidated_Windows\MedMH_AI_Workforce_v3_9_1
+Trying py -3.14 ...
+
+Python 3.14.7, 64-bit; standard build: True
+Selected py -3.14
+
+[1/5] Upgrade pip
+Requirement already satisfied: pip in .\.venv\Lib\site-packages (26.2.1)
+Collecting pip
+  Using cached pip-26.2.2-py3-none-any.whl.metadata (4.6 kB)
+Using cached pip-26.2.2-py3-none-any.whl (1.8 MB)
+Installing collected packages: pip
+  Attempting uninstall: pip
+    Found existing installation: pip 26.2.1
+    Uninstalling pip-26.2.1:
+      Successfully uninstalled pip-26.2.1
+Successfully installed pip-26.2.2
+
+[1/5] Install Python dependencies (binary wheels only)
+quests-file-3.0.1 rpds-py-2026.9.1 six-1.17.0 starlette-1.9.0 streamlit-1.66.1 tldextract-5.4.0 typing-extensions-4.16.0
+ tzdata-2026.5 urllib3-2.8.0 uvicorn-0.54.0 watchdog-6.0.0 websockets-17.3
+
+[2/5] Install Playwright Chromium
+
+
+[3/5] Check Python installation
+
+
+[4/5] Check Node.js version
+Node.js v24.21.0 verified.
+
+[4/5] Install WhatsApp dependencies
+
+
+[5/5] Apply WhatsApp compatibility layer
+
+
+[5/5] Prepare local AI secrets and settings
+
+
+INSTALL COMPLETE. Run START.bat.
+**********************
+Fin de la transcription Windows PowerShell
+Heure de fin : 20261021220332
+**********************
