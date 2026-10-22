@@ -1,0 +1,4 @@
+PCC isolated patch test
+fixture=edit
+state=before
+Safe, disposable fixture; no application imports refer to this file.

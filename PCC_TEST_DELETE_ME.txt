@@ -1,0 +1,4 @@
+PCC isolated patch test
+fixture=delete
+state=present
+Only this known test fixture will be deleted by PCC_02_FULL_TEST.zip.
