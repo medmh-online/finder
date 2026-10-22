@@ -116,6 +116,23 @@ def render_workers(access,repo):
             st.info('Chrome was closed. Use Open WhatsApp to reopen the saved session.')
         elif state=='disconnected':
             st.info('Click Open WhatsApp to start a worker-specific Chrome window.')
+        # These are persistent Python-gateway records, not WhatsApp Web read
+        # receipts. No message text, phone number or API key is shown.
+        try:
+            with db.connect() as _con:
+                _in=_con.execute("SELECT COUNT(*) AS n,MAX(created_at) AS latest FROM ai_messages WHERE worker_id=? AND direction='in'",(picked,)).fetchone()
+                _lost=_con.execute("SELECT COUNT(*) AS n,MAX(sent_at) AS latest FROM ai_unmatched WHERE worker_id=? AND body NOT LIKE '[Outgoing] %'",(picked,)).fetchone()
+                _out=_con.execute("SELECT COUNT(*) AS n FROM ai_messages WHERE worker_id=? AND direction='out' AND status IN ('queued','queued_reply','sending')",(picked,)).fetchone()
+                _latest=_con.execute("SELECT t.stage,t.detail FROM ai_reply_trace t WHERE t.worker_id=? ORDER BY t.updated_at DESC LIMIT 1",(picked,)).fetchone()
+            st.caption(f"AI gateway intake · Matched inbound: {_in['n']} · Unmatched inbound: {_lost['n']} · Outgoing waiting: {_out['n']}")
+            if _latest:
+                st.caption('Latest AI reply stage: '+str(_latest['stage'])+' — '+str(_latest['detail']))
+            if state=='ready' and _in['n']==0 and _lost['n']==0:
+                st.info('No inbound events are recorded by the AI gateway yet. A WhatsApp read receipt does not mean the AI received the event. Send a fresh test message and refresh this page.')
+            elif _lost['n']:
+                st.warning('Some incoming messages are unmatched; open Why no AI reply? below to check the sender identity and assigned lead.')
+        except Exception as _exc:
+            st.warning('AI gateway intake diagnostics unavailable: '+type(_exc).__name__)
         if status.get('tabStatus')=='logged_out':
             st.warning('WhatsApp shows its logged-out page. Reopen WhatsApp in this worker Chrome and finish signing in before attaching AI.')
         elif status.get('tabStatus')=='no_whatsapp_tab':

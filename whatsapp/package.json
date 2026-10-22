@@ -6,7 +6,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "check": "node --check server.js"
+    "check": "node --check server.js",
+    "test:inbound": "node ../tests/test_whatsapp_inbound_events.js",
+    "test": "node ../tests/test_whatsapp_inbound_events.js"
   },
   "engines": {
     "node": ">=20"

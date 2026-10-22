@@ -289,8 +289,25 @@ function wireMessages(s,client) {
   });
   client.on('auth_failure',e=>{if(valid()){s.status='auth_failure';s.attachStage='authentication_failed';s.error=keep(e);}});
   client.on('disconnected',e=>{if(valid()){s.status='ai_disconnected';s.attachStage='disconnected';s.error='WhatsApp disconnected: '+keep(e);s.browserOpen=!!client.pupBrowser?.isConnected?.();}});
-  client.on('message',m=>{
-    if (!valid() || m.fromMe || !m.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
+  // WhatsApp versions may emit either event for inbound messages. Accept both
+  // while deduplicating by the provider's unique message ID per worker.
+  const inboundSeen = new Map();
+  const inboundEventId = m => {
+    const id=String(m?.id?._serialized||'');
+    // When no provider ID is supplied, keep the old unique-event fallback.
+    return id || `${m.from}:${m.timestamp}:${crypto.randomUUID()}`;
+  };
+  const handleInbound = (m,source) => {
+    if (!valid() || !m || m.fromMe || !m.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
+    const providerId=String(m?.id?._serialized||'');
+    if (providerId) {
+      if (inboundSeen.has(providerId)) return;
+      inboundSeen.set(providerId,Date.now());
+      if (inboundSeen.size>3000) inboundSeen.delete(inboundSeen.keys().next().value);
+    }
+    console.log('[WhatsApp inbound]',s.workerId.slice(0,8),source,
+      m.from.endsWith('@lid')?'lid':'phone','event accepted');
+
     // The chat can be a WhatsApp opaque @lid ID, which is NOT a telephone
     // number. Only trust a contact phone if WhatsApp exposes a real @c.us ID.
     void (async()=>{
@@ -335,7 +352,7 @@ function wireMessages(s,client) {
       }
       if(!valid())return;
       if(senderPhone && s.verifiedPhones.size<2500)s.verifiedPhones.set(m.from,senderPhone);
-      const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.from}:${m.timestamp}:${crypto.randomUUID()}`,
+      const ev={workerId:s.workerId,eventId:inboundEventId(m),
         chatId:m.from,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp};
       if(senderPhone)ev.senderPhone=senderPhone;
       enqueue(ev);flush().catch(console.error);
@@ -343,10 +360,17 @@ function wireMessages(s,client) {
         setImmediate(()=>verifyLidAgainstAssignedPhones(s,m.from).catch(e=>
           console.warn('[WhatsApp identity] sender:',keep(e))));
       }
-    })().catch(e=>console.error('[inbound]',keep(e)));
-  });
+    })().catch(e=>{
+      // If the enqueue failed before persisting the event, the other callback
+      // may try again rather than losing the message for this worker.
+      if(providerId) inboundSeen.delete(providerId);
+      console.error('[inbound]',keep(e));
+    });
+  };
+  client.on('message',m=>handleInbound(m,'message'));
   client.on('message_create',m=>{
-    if(!valid() || !m.fromMe || !m.to || !/@(?:c\.us|lid)$/.test(m.to)) return;
+    if (!m?.fromMe) { handleInbound(m,'message_create'); return; }
+    if(!valid() || !m.to || !/@(?:c\.us|lid)$/.test(m.to)) return;
     const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.to}:${m.timestamp}:${crypto.randomUUID()}`,
       chatId:m.to,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp,direction:'out'};
     // A manual outgoing conversation can later identify the same LID chat.

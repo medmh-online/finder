@@ -125,3 +125,11 @@ assigned to that worker, a tested Gemini model is selected, the daily token
 limit is available, and the message appears as **received** in the diagnostic.
 For an unmatched `@lid` message use **Retry matching unmatched WhatsApp
 identities**; only WhatsApp-confirmed mappings can be accepted.
+
+### Incoming WhatsApp events and troubleshooting
+
+The connected WhatsApp client now accepts incoming events from both the standard `message` hook and the `message_create` hook, with per-worker deduplication using WhatsApp's message IDs. This is a compatibility fallback; it does not bypass assignment, identity verification, opt-out handling or Gemini limits.
+
+Under **AI Workers → WhatsApp browser**, the **AI gateway intake** line shows matched/unmatched incoming event counts, pending replies and the most recent reply stage. These counters are read from the local database, not inferred from WhatsApp read receipts. If messages are unmatched, open **Why no AI reply?** for the assigned lead; opaque `@lid` identifiers must be verified by WhatsApp. If there are no recorded events at all, inspect `[WhatsApp inbound]`, `[event queue]` and `[WhatsApp event]` in the `START.bat` console.
+
+Run `npm run test` from the `whatsapp` directory to verify listener deduplication with synthetic messages, without starting the live service.
