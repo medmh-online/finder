@@ -559,6 +559,24 @@ async function handler(req,res) {
       if(data.confirmation!=='BACKUP_AND_RESET_PAIRING')return respond(res,400,{error:'Explicit confirmation required'});
       return respond(res,200,await backupAndResetPairing(id));
     }
+    if(req.url==='/recover-identities') {
+      const s=clients.get(id);
+      if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')
+        return respond(res,409,{error:'WhatsApp worker must be READY'});
+      if(s.recoveryRunning)return respond(res,200,{running:true});
+      if(s.lastManualRecoveryAt && Date.now()-s.lastManualRecoveryAt<120000)
+        return respond(res,200,{cooldown:true});
+      s.lastManualRecoveryAt=Date.now();
+      // Manual troubleshooting may recheck a recent unresolved mapping immediately.
+      s.identityRetryAt?.clear();
+      s.recoveryRunning=true;
+      setImmediate(() => {
+        recoverEarlierUnmatched(s)
+          .catch(e=>console.warn('[WhatsApp identity] manual recovery:',keep(e,140)))
+          .finally(()=>{s.recoveryRunning=false;});
+      });
+      return respond(res,200,{started:true});
+    }
     if(req.url==='/verify-number') {
       const s=clients.get(id);
       if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')

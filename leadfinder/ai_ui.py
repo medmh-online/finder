@@ -72,24 +72,13 @@ def render_workers(access,repo):
             d1,d2=st.columns(2)
             delay_min=d1.number_input('Minimum reply delay (seconds)',0,60,int(worker.get('reply_delay_min') or 4))
             delay_max=d2.number_input('Maximum reply delay (seconds)',0,60,int(worker.get('reply_delay_max') or 30))
-            outreach=st.toggle('Automatically introduce MedMH to eligible opted-in leads',
-                value=bool(worker['outreach_enabled']))
             if st.form_submit_button('Save worker controls'):
                 try:
                     db.configure_worker(picked,name=label,enabled=int(enabled),batching_seconds=batching,
-                        outreach_enabled=int(outreach),daily_new_contacts=int(daily),
+                        daily_new_contacts=int(daily),
                         daily_token_limit=int(token_limit),reply_delay_min=int(delay_min),reply_delay_max=int(delay_max))
                     st.success('Saved');st.rerun()
                 except ValueError as exc:st.error(str(exc))
-        st.caption('Reply delay and typing indicators are normal chat pacing, not protection from WhatsApp restrictions. Daily token limits are application-level estimates.')
-        st.divider()
-        st.subheader('Automatic WhatsApp verification and lead assignment')
-        st.caption('Check assigned-candidate mobile numbers only when a connected worker is ready; status is stored internally. No message is sent during verification.')
-        choice=st.toggle('Verify and assign confirmed WhatsApp numbers automatically',value=db.auto_assignment_enabled(),key='wa_auto_assign_enabled')
-        if choice!=db.auto_assignment_enabled():
-            db.set_auto_assignment(choice);st.rerun()
-        st.caption('Verification is capped at 20 lookups/day; WhatsApp registration is not marketing consent.')
-        st.divider()
         st.subheader('AI usage · recent 14 days')
         logs=db.usage(picked,limit=2000)
         if logs:

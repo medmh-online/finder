@@ -87,3 +87,15 @@ The worker must report **ready**, not merely have a signed-in Chrome window.
 An opaque `@lid` is not a phone number; only a WhatsApp-verified mapping can associate it with a lead.
 If the message was received but remains unanswered, inspect the AI gateway console for errors.
 "I can see the lead in Leads" alone does not establish message identity or a valid worker assignment.
+
+## Overview date range and inbound-reply troubleshooting
+
+The Overview page provides optional **From** and **To** dates, initially blank (**All time**). Dates use the configured local timezone; To includes the complete selected calendar day. Leads, pipeline, and website-quality charts filter by each lead's creation date and display the lead's **current** CRM stage, not a historical snapshot. Conversation and token reports filter by event timestamp, and the current AI worker counts/state remain current. Campaign performance remains **lifetime** and is explicitly labeled when dates are selected.
+
+The two deprecated automatic operations have been removed from AI Worker Controls: automatic first introductions and automatic bulk WhatsApp registration/assignment. Their background schedulers are disabled; manual first contact remains subject to the application's existing consent protections. Incoming-message identity verification for assigned leads is still available, since it is needed for legitimate replies.
+
+If a connected worker does not reply, open **AI Workers → WhatsApp browser → Why no AI reply? · Check a lead**. Verify the assigned worker and model, whether the inbound message is linked, and whether the last outgoing reply is pending, sent, or uncertain. If there are unmatched `@lid` messages, **Retry matching unmatched WhatsApp identities** performs a rate-limited verification using WhatsApp's reported identities. It never sends a message or infers a phone number from LID digits. If WhatsApp cannot verify the identity, the conversation is left unmatched and no AI reply is sent. A separate test WhatsApp account must send the inbound message; messages sent from the worker's own account are ignored.
+
+The worker AI prompt now explicitly asks Gemini to answer a **first greeting** rather than silently ignore it. This is still subject to worker readiness, safe identity matching, Gemini availability, and conversation/opt-out rules. Use a test chat and check the console for `[reply]`, `[agent]`, and `[WhatsApp identity]` errors if it remains unanswered.
+
+Offline test: `python -m unittest discover -s tests -p test_overview_date_filter.py -v`. The update does not change database schemas, saved worker keys, sessions, or customer data.

@@ -10,6 +10,7 @@ import json
 import sqlite3
 from pathlib import Path
 from zoneinfo import ZoneInfo
+from leadfinder.overview_filters import date_window, filter_leads_by_created_at
 
 import pandas as pd
 import streamlit as st
@@ -126,10 +127,11 @@ def launch_pending(repo: Repository, paths: AppPaths) -> bool:
         return False
 
 
-def render_overview(repo: Repository, config: dict, paths: AppPaths) -> None:
+def render_overview(repo: Repository, config: dict, paths: AppPaths,
+                    start: date | None = None, end: date | None = None) -> None:
     st.header("MedMH · Operations overview")
     st.caption("Live prospecting, pipeline and AI worker performance — all in one place.")
-    all_leads = frame_for(repo)
+    all_leads = filter_leads_by_created_at(frame_for(repo), start, end, config['app']['timezone'])
     active = all_leads[~all_leads["archived"]] if not all_leads.empty else all_leads
     a,b,c,d=st.columns(4)
     a.metric('Active leads',len(active))
@@ -148,7 +150,12 @@ def render_overview(repo: Repository, config: dict, paths: AppPaths) -> None:
         st.button('Leads & conversations',on_click=go_to,args=('Leads',),use_container_width=True)
         st.button('Discovery',on_click=go_to,args=('Discovery',),use_container_width=True)
         st.subheader('Recent search jobs')
-        jobs=repo.list_jobs(limit=5)
+        jobs=repo.list_jobs(limit=100)
+        if start or end:
+            low,high=date_window(start,end,config['app']['timezone'])
+            jobs=[j for j in jobs if pd.notna(pd.to_datetime(j.get('created_at'),utc=True,errors='coerce'))
+                  and low <= pd.to_datetime(j['created_at'],utc=True).timestamp() < high]
+        jobs=jobs[:5]
         if jobs:
             st.dataframe(pd.DataFrame([{'Job':j['id'],'Status':j['state'],
                 'New leads':(j.get('progress') or {}).get('saved',0)} for j in jobs]),
@@ -841,11 +848,12 @@ def render_leads(repo: Repository, config: dict, paths: AppPaths, access: Worksp
         render_lead_chat_dialog(int(requested_chat), access)
 
 
-def render_analytics(repo: Repository, config: dict, paths: AppPaths, embedded: bool = False) -> None:
+def render_analytics(repo: Repository, config: dict, paths: AppPaths, embedded: bool = False,
+                     start: date | None = None, end: date | None = None) -> None:
     st.subheader("Pipeline and analytics" if embedded else "Analytics")
-    all_leads = frame_for(repo)
+    all_leads = filter_leads_by_created_at(frame_for(repo), start, end, config['app']['timezone'])
     if all_leads.empty:
-        st.info("Analytics will appear once you have leads.")
+        st.info("No leads created in this date range." if start or end else "Analytics will appear once you have leads.")
         return
     include_archived = st.checkbox("Include archived leads in the overview", value=False)
     leads = all_leads if include_archived else all_leads[~all_leads["archived"]]
@@ -868,6 +876,8 @@ def render_analytics(repo: Repository, config: dict, paths: AppPaths, embedded: 
         st.bar_chart(websites, color="#3B82A0")
     st.caption("These charts show current states. Historical stage conversion rates require dated transition cohorts and are not inferred from these counts.")
     st.subheader("Campaign performance")
+    if start or end:
+        st.caption("Campaign performance below is lifetime data, independent of the selected date range. Other lead metrics use the selected creation dates.")
     metrics = repo.campaign_metrics()
     if metrics:
         result = pd.DataFrame(metrics)
@@ -952,7 +962,8 @@ def render_settings(repo: Repository, config: dict, paths: AppPaths) -> None:
 
 
 
-def render_ai_operations(access: WorkspaceAccess) -> None:
+def render_ai_operations(access: WorkspaceAccess, start: date | None = None,
+                         end: date | None = None, tz_name: str = 'UTC') -> None:
     """Monitor local workers, WhatsApp verification, conversations and token usage."""
     from leadfinder.ai_workers import WorkerDB
     from leadfinder.ai_runtime import node_api
@@ -961,30 +972,32 @@ def render_ai_operations(access: WorkspaceAccess) -> None:
     if not workers:
         st.info('No AI workers configured yet. Create one under AI Workers.')
         return
+    low, high = date_window(start, end, tz_name)
+    # All event/usage counts use the same local-date interval converted to UTC.
     with db.connect() as con:
         stats=con.execute("""SELECT
-            (SELECT count(*) FROM ai_messages WHERE direction='in') incoming,
-            (SELECT count(*) FROM ai_messages WHERE direction='out' AND status='sent') sent,
-            (SELECT count(*) FROM ai_messages WHERE status IN ('queued','queued_reply','sending')) pending,
+            (SELECT count(*) FROM ai_messages WHERE direction='in' AND created_at>=? AND created_at<?) incoming,
+            (SELECT count(*) FROM ai_messages WHERE direction='out' AND status='sent' AND created_at>=? AND created_at<?) sent,
+            (SELECT count(*) FROM ai_messages WHERE status IN ('queued','queued_reply','sending') AND created_at>=? AND created_at<?) pending,
             (SELECT count(*) FROM ai_lead_control WHERE paused=1) paused,
             (SELECT count(*) FROM ai_lead_control WHERE handoff=1) handoffs,
-            (SELECT coalesce(sum(input_tokens),0) FROM ai_usage) input_tokens,
-            (SELECT coalesce(sum(output_tokens),0) FROM ai_usage) output_tokens,
-            (SELECT count(*) FROM ai_whatsapp_checks WHERE status='registered') registered,
-            (SELECT count(*) FROM ai_whatsapp_checks WHERE status='not_registered') not_registered
-            """).fetchone()
+            (SELECT coalesce(sum(input_tokens),0) FROM ai_usage WHERE recorded_at>=? AND recorded_at<?) input_tokens,
+            (SELECT coalesce(sum(output_tokens),0) FROM ai_usage WHERE recorded_at>=? AND recorded_at<?) output_tokens,
+            (SELECT count(*) FROM ai_whatsapp_checks WHERE status='registered' AND checked_at>=? AND checked_at<?) registered,
+            (SELECT count(*) FROM ai_whatsapp_checks WHERE status='not_registered' AND checked_at>=? AND checked_at<?) not_registered
+            """, (low,high)*3 + (low,high)*4).fetchone()
         recent=con.execute("""SELECT l.name,m.direction,m.status,m.body,m.created_at
             FROM ai_messages m LEFT JOIN leads l ON l.id=m.lead_id
-            ORDER BY m.id DESC LIMIT 12""").fetchall()
+            WHERE m.created_at>=? AND m.created_at<? ORDER BY m.id DESC LIMIT 12""", (low,high)).fetchall()
     st.subheader('AI workforce monitor')
     c1,c2,c3,c4,c5=st.columns(5)
     c1.metric('Workers',len(workers))
     c2.metric('Received messages',stats['incoming'])
     c3.metric('Sent messages',stats['sent'])
     c4.metric('Queued',stats['pending'])
-    c5.metric('Need human',stats['handoffs'])
+    c5.metric('Need human (current)',stats['handoffs'])
     c1,c2,c3,c4=st.columns(4)
-    c1.metric('AI paused chats',stats['paused'])
+    c1.metric('AI paused chats (current)',stats['paused'])
     c2.metric('Verified WhatsApp',stats['registered'])
     c3.metric('Not registered',stats['not_registered'])
     c4.metric('Gemini tokens',f"{stats['input_tokens']+stats['output_tokens']:,}")
@@ -1002,23 +1015,24 @@ def render_ai_operations(access: WorkspaceAccess) -> None:
         daily=con.execute('''SELECT date(recorded_at,'unixepoch') AS day,
             SUM(input_tokens) AS input, SUM(output_tokens) AS output, COUNT(*) AS calls,
             SUM(CASE WHEN error!='' THEN 1 ELSE 0 END) AS failures
-            FROM ai_usage WHERE recorded_at>=strftime('%s','now','-30 days')
-            GROUP BY day ORDER BY day''').fetchall()
+            FROM ai_usage WHERE recorded_at>=? AND recorded_at<?
+            GROUP BY day ORDER BY day''',(low,high)).fetchall()
         model_usage=con.execute('''SELECT model,SUM(input_tokens) AS input,SUM(output_tokens) AS output,
-            COUNT(*) AS calls FROM ai_usage GROUP BY model ORDER BY input+output DESC LIMIT 10''').fetchall()
+            COUNT(*) AS calls FROM ai_usage WHERE recorded_at>=? AND recorded_at<?
+            GROUP BY model ORDER BY input+output DESC LIMIT 10''',(low,high)).fetchall()
         activity=con.execute('''SELECT date(created_at,'unixepoch') AS day,
             SUM(CASE WHEN direction='in' THEN 1 ELSE 0 END) AS inbound,
             SUM(CASE WHEN direction='out' AND status='sent' THEN 1 ELSE 0 END) AS outbound
-            FROM ai_messages WHERE created_at>=strftime('%s','now','-30 days')
-            GROUP BY day ORDER BY day''').fetchall()
-    st.subheader('Gemini token usage · last 30 days (UTC)')
+            FROM ai_messages WHERE created_at>=? AND created_at<?
+            GROUP BY day ORDER BY day''',(low,high)).fetchall()
+    st.subheader('Gemini token usage · selected period (UTC days)')
     if daily:
         trend=pd.DataFrame([dict(x) for x in daily]).set_index('day')
         st.line_chart(trend[['input','output']])
         c1,c2,c3=st.columns(3)
         c1.metric('Total input tokens',f"{stats['input_tokens']:,}")
         c2.metric('Total output tokens',f"{stats['output_tokens']:,}")
-        c3.metric('Generation errors (30 days)',int(trend['failures'].sum()))
+        c3.metric('Generation errors (period)',int(trend['failures'].sum()))
         st.caption('Requests, tokens and errors are measured from API metadata; failures without a Gemini response may not report token usage.')
         st.dataframe(trend[['calls','failures','input','output']].tail(7),width='stretch')
     else:st.info('No Gemini token history yet.')
@@ -1030,7 +1044,7 @@ def render_ai_operations(access: WorkspaceAccess) -> None:
             st.bar_chart(models[['input','output']])
         else:st.caption('No model activity yet.')
     with c2:
-        st.subheader('Conversation volume · 30 days')
+        st.subheader('Conversation volume · selected period')
         if activity:
             volume=pd.DataFrame([dict(r) for r in activity]).set_index('day')
             st.line_chart(volume[['inbound','outbound']])
@@ -1088,10 +1102,21 @@ def main() -> None:
             with build: render_campaigns(repo,config,paths)
             with runs: render_jobs(repo,config,paths)
         elif page=='Overview':
-            render_overview(repo,config,paths)
+            st.header('Reporting period')
+            st.caption('Leave either date empty for an open-ended range. Both empty = All time. Dates use your configured local timezone.')
+            col_from,col_to=st.columns(2)
+            start=col_from.date_input('From (optional)', value=None, key='overview_start')
+            end=col_to.date_input('To (optional)', value=None, key='overview_end')
+            try:
+                date_window(start,end,config['app']['timezone'])
+            except ValueError as exc:
+                st.error(str(exc))
+                st.stop()
+            st.caption('All time' if start is None and end is None else 'Leads filtered by creation date; conversation and token data by event date. Current CRM stages and worker states are not historical snapshots.')
+            render_overview(repo,config,paths,start,end)
             st.divider()
-            render_analytics(repo,config,paths,embedded=True)
-            render_ai_operations(access)
+            render_analytics(repo,config,paths,embedded=True,start=start,end=end)
+            render_ai_operations(access,start,end,config['app']['timezone'])
         else:
             render_settings(repo,config,paths)
     except (ConfigError,OSError,sqlite3.Error,WorkspaceError) as exc:

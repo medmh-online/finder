@@ -126,6 +126,15 @@ def render_reply_diagnostics(db, worker_id: str, live: dict) -> None:
             else:
                 st.success('Lead assignment and reply state look eligible. Check whether its message reached the gateway.')
             st.caption('Latest linked inbound: ' + _date(item['last_inbound']))
+            if item.get('last_inbound_id') and item['last_inbound_id'] > int(item.get('replied_through') or 0):
+                if worker.get('enabled') and state == 'ready' and not item.get('ai_paused') and not item.get('ai_handoff'):
+                    st.info('Inbound is stored but still awaiting an AI decision or queued reply. Check the gateway terminal for [reply] or [agent loop] errors.')
+            with db.connect() as con:
+                pending = con.execute('''SELECT status,kind,created_at FROM ai_messages
+                    WHERE lead_id=? AND direction='out' ORDER BY id DESC LIMIT 1''', (item['id'],)).fetchone()
+            if pending:
+                st.caption('Last outbound attempt: ' + str(pending['status']) + ' · ' + str(pending['kind']) + ' · ' + _date(pending['created_at']))
+
             if not item['assigned_worker'] and not item['conflicting_numbers'] and not item['archived']:
                 if st.button('Assign this lead to this WhatsApp worker',key='reply_diag_assign_'+worker_id):
                     db.assign(worker_id,[int(item['id'])])
@@ -139,6 +148,22 @@ def render_reply_diagnostics(db, worker_id: str, live: dict) -> None:
                               for x in recent)
             st.warning(f'{len(unmatched)} recent unmatched incoming event(s) for this worker. Types: {types}.')
             st.caption('Opaque WhatsApp @lid IDs must be resolved through a WhatsApp-verified phone mapping, not by guessing their digits.')
+        if state == 'ready' and unmatched and any(str(x['chat_id']).endswith('@lid') for x in unmatched):
+            st.caption('If these are your messages, WhatsApp may not yet expose their verified phone mapping.')
+            if st.button('Retry matching unmatched WhatsApp identities', key='reply_diag_retry_'+worker_id):
+                try:
+                    from .ai_runtime import node_api
+                    response = node_api('/recover-identities', {'workerId': worker_id}, timeout=8)
+                    if response.get('started'):
+                        st.info('Safe identity recovery started. Refresh this diagnostic after a few seconds. No messages are sent.')
+                    elif response.get('running'):
+                        st.info('Identity recovery is already running. Refresh after it finishes.')
+                    elif response.get('cooldown'):
+                        st.info('A recovery check was run recently. Try again in about two minutes.')
+                    else:
+                        st.warning('The WhatsApp worker did not start identity recovery.')
+                except Exception as exc:
+                    st.error('Cannot request identity recovery: ' + type(exc).__name__)
         # Show safe, category-only API failures, not key-bearing raw response text.
         with db.connect() as con:
             last_error = con.execute("""SELECT error FROM ai_usage

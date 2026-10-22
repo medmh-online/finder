@@ -280,7 +280,8 @@ def answer_one(db,thread,base_data):
       "CRITICAL: NEVER promise a developer will contact them using action=reply. "
       "If you mention developer follow-up, return action=complete and customer-stated qualification facts. "
       "If a human is requested: action handoff. If stop: action stop; acknowledge once. "
-      "For simple acknowledgments: ignore. Never promise an exact response time. "
+      "Never ignore a first direct greeting (hi, hello, salam) or a genuine question. Reply briefly to welcome a first-time contact. "
+      "Ignore only later standalone acknowledgments (ok, thanks) when no new question was asked. Never promise an exact response time. "
       "Return ONLY JSON: {\"action\":\"reply|ignore|stop|handoff|complete\",\"reply\":\"short text\",\"qualification\":{\"service\":\"\",\"requirements\":\"\",\"budget\":\"\",\"deadline\":\"\"},\"share_portfolio\":false}. "
       "Qualification facts must be said by customer; never guess. "
       f"Questions already asked: {questions}/2. Known facts: {json.dumps(prior_facts,ensure_ascii=False)[:280]}. "
@@ -605,26 +606,12 @@ def process_registry(registry):
                 for phone,wid,lid in db.historical_outbound():
                     if phone: ledger.observe_sent(phone,wid,lid)
                 process_registry.backfilled.add(db.path)
-            auto_assign_verified(db,ledger)
+            # Automatic WhatsApp verification/assignment is disabled; only verified incoming identity matching stays active.
             # Follow-up scheduling was removed from this simplified edition.
             send_pending(db,ledger)
             thread=db.due()
             if thread:
                 executor.submit(process_answer,db,thread,registry.base)
-            else:
-                # A customer reply has priority over initiating another conversation.
-                ready=set()
-                for w in db.workers():
-                    if not (w['enabled'] and w['outreach_enabled']):continue
-                    try:
-                        if node_api('/status',{'workerId':w['id']},timeout=5).get('state')=='ready':
-                            ready.add(w['id'])
-                    except Exception:
-                        continue
-                if ready:
-                    intro=db.intro_due(ledger,ready_worker_ids=ready)
-                    if intro:
-                        executor.submit(process_intro,db,intro,registry.base)
             send_pending(db,ledger)
         except Exception as exc:
             print(f'[agent] {worker_id[:8]}: {type(exc).__name__}: {exc}',flush=True)
