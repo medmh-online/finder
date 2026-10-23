@@ -103,8 +103,8 @@ def media_unavailable_excuse(reply):
     import unicodedata
     s=''.join(c for c in unicodedata.normalize('NFKD',str(reply or '').casefold())
               if not unicodedata.combining(c))
-    return bool(re.search(r'(?:cv|pdf|document|attachment|fichier|piece jointe|media|file)',s)
-                and re.search(r'(?:peux pas|impossible|indisponible|not available|cannot|can.t|unable|souci technique|probleme technique|technical issue)',s))
+    return bool(re.search(r'(?:cv|pdf|document|attachment|fichier|piece jointe|media|file|audio|vocal|voice|enregistrement)',s)
+                and re.search(r'(?:peux pas|impossible|indisponible|not available|cannot|can.t|unable|souci technique|probleme technique|technical issue|n.ai pas|pas de fichier|don.t have|no audio available)',s))
 
 
 def independent_media_review(result):
@@ -169,10 +169,20 @@ def route_incoming_attachment(db,worker,base_data,thread,mission,messages,all_me
         'You are an attachment request classifier for a WhatsApp AI. '
         'Interpret the latest customer message semantically in its language (including Darija). '
         'Decide whether the customer actually requests one of the listed files, respecting each send_when rule. '
+        'The file kind voice means a REAL prerecorded audio or WhatsApp voice note, not text. '
+        'If the customer asks for a spoken introduction, an intro they can hear/listen to, '
+        'a presentation vocale, an audio message, a vocal, or a Darija phrase such as '
+        '"bghit introduction tkun msm3a", select the matching uploaded voice file when enabled. '
+        'Do not say audio is unavailable merely because you cannot generate speech; an uploaded voice file can be sent. '
+        'If a customer specifically requests the same CV again after it was already SENT successfully once, '
+        'select it again when available; this is allowed one more time only. '
+        'Do NOT select a previously sent document again on unrelated messages or a routine acknowledgment. '
         'A CV or portfolio request alone never requires human handoff. '
         'Set human_required=true ONLY if the customer additionally asks for a human, interview, '
         'meeting, salary negotiation, binding decision, or something requiring the profile owner. '
         'If a matching file is unavailable, still select its ID; Python validates status. '
+        'The statuses sent, uncertain, and queued have different meanings: sent is confirmed delivery, '
+        'uncertain/queued never justify another automatic send. '
         'Set recipient_confirms_no_delivery=true ONLY if this incoming message EXPLICITLY says '
         'the recipient did not receive the previously requested attachment. '
         'Merely repeating send me the CV is NOT confirmation of non-delivery. '
@@ -466,8 +476,12 @@ def answer_one(db,thread,base_data):
     mission=selected_instructions(db, thread['worker_id'], thread)
     permitted_media=db.available_media_for_lead(thread.get('instruction_profile_id'),thread['lead_id'])
     # Only metadata, never file contents/paths or binary data, go to Gemini.
+    # The front-door attachment router handles explicit repeat requests.
+    # Generic reply generation may use only files never confirmed as sent;
+    # otherwise it could casually select a second CV without a new request.
     media_catalog=[{'media_id':m['id'],'name':m['display_name'],
-                    'kind':m['kind'],'send_when':m['description']} for m in permitted_media]
+                    'kind':m['kind'],'send_when':m['description']}
+                   for m in permitted_media if int(m.get('confirmed_sends') or 0)==0]
     media_history=db.media_delivery_state(thread.get('instruction_profile_id'),thread['lead_id'])
     instructions=(
       "You are an AI assistant handling a WhatsApp conversation according to the ACTIVE PROFILE below. "
@@ -479,7 +493,7 @@ def answer_one(db,thread,base_data):
       "If the person requests a human, an interview or needs a personal decision, choose action=handoff. "
       "You MAY select one approved uploaded attachment by media_id when it is useful and complies with its send_when instructions. "
       "File sending is automatic: do not ask for owner approval. Never select a file ID not listed in ALLOWED MEDIA. "
-      "Only ONE file per reply. Do not resend the same file to the same contact. Do not send unsolicited CVs unless its media instructions allow it. "
+      "Only ONE file per reply. A file may be sent a second time ONLY when the recipient explicitly asks for it again; maximum two confirmed sends to a lead. Never resend during an unconfirmed or pending send. Do not send unsolicited CVs unless the profile allows it. "
       "A request for a CV or portfolio alone is NOT a handoff. If the profile allows it, you MUST choose action=reply WITH the matching media_id; continue the chat afterward. "
       "IMPORTANT: NEVER claim 'voici/voilà le CV', 'attached', or that you have sent a file unless the SAME JSON reply contains its permitted media_id. "
       "When media_id is null, your reply is TEXT ONLY; it is NOT a file delivery, even if you mentioned a CV previously. "
@@ -517,12 +531,48 @@ def answer_one(db,thread,base_data):
                 {m['id'] for m in permitted_media})
             print('[AI media router]',thread['worker_id'][:8], 'lead',thread['lead_id'],
                   'requested',requested,'human',human_required,
-                  'selected',bool(matched),'eligible',len(permitted_media),flush=True)
+                  'selected',bool(matched),'eligible',len(permitted_media),
+                  'voice_eligible',sum(m['kind']=='voice' for m in permitted_media),flush=True)
             if requested and not human_required:
+                # The classifier may understand an audio request but forget the
+                # saved media ID. Re-check only when it explicitly found a file
+                # request. This preserves AI-based interpretation without a
+                # brittle voice-note keyword trigger.
+                if matched is None and permitted_media:
+                    allowed_options=[{'media_id':m['id'],'name':m['display_name'],
+                                      'kind':m['kind'],'send_when':m['description']}
+                                     for m in permitted_media]
+                    latest_inbound=next((m.get('body','') for m in reversed(messages)
+                                         if m.get('direction')=='in'),'')
+                    review_instruction=(
+                        'The customer requested an uploaded file, but the earlier classification '
+                        'forgot to select its identifier. Choose the ONE saved attachment that '
+                        'actually matches this customer message. Voice recordings are real '
+                        'uploaded audio/WhatsApp voice notes and can be sent; for a request '
+                        'for an audible spoken introduction select the voice file. '
+                        'Never select a CV when the customer asks for a voice note. '
+                        'Do not select an unrelated file. Return ONLY JSON: '
+                        '{"requested_matching_file":true|false,"media_id":"id or null"}. '
+                        'AVAILABLE MEDIA: '+json.dumps(allowed_options,ensure_ascii=False)[:2500]
+                        +'\nCUSTOMER: '+json.dumps(latest_inbound[:700],ensure_ascii=False))
+                    review_raw,_=gemini_with_fallback(db,worker,base_data,review_instruction,
+                        [{'role':'user','parts':[{'text':'Choose the matching uploaded file or none.'}]}],
+                        max_tokens=180,purpose='reply',lead_id=thread['lead_id'])
+                    try:
+                        reviewed=independent_media_review(review_raw)
+                    except (ValueError, TypeError):
+                        # An invalid optional second opinion must not block the
+                        # conversation or turn a file request into a handoff.
+                        reviewed=None
+                    if reviewed in {m['id'] for m in permitted_media}:
+                        matched=reviewed
+                        print('[AI media router recovery]',thread['worker_id'][:8],
+                              'lead',thread['lead_id'],'matched_uploaded_file',flush=True)
                 if matched in {m['id'] for m in permitted_media}:
                     db.validate_media_choice(thread,matched)
                     record=next(m for m in permitted_media if m['id']==matched)
                     caption=('Voici le document demandé 😊' if record['kind']=='document'
+                             else 'Voici le vocal demandé 😊' if record['kind']=='voice'
                              else 'Voici le fichier demandé 😊')
                     db.commit_reply(thread,caption,media_id=matched)
                     return
@@ -533,6 +583,7 @@ def answer_one(db,thread,base_data):
                     selected=next((a for a in full_catalog if a['id']==matched),None)
                     if selected and selected['enabled']:
                         caption=('Voici le document demandé 😊' if selected['kind']=='document'
+                                 else 'Voici le vocal demandé 😊' if selected['kind']=='voice'
                                  else 'Voici le fichier demandé 😊')
                         retried=db.queue_recipient_confirmed_media_retry(thread,matched,caption)
                         if retried:
@@ -549,10 +600,11 @@ def answer_one(db,thread,base_data):
                     (a['display_name'] for a in full_catalog if a['id']==matched),'')]
                 uncertain=any(m['status'] in ('uncertain','sending','queued_reply') for m in past)
                 previously_sent=any(m['status']=='sent' for m in past)
-                explanation=('L’envoi du document n’est pas encore confirmé. Je préfère éviter un double envoi.'
+                requested_label=('message vocal' if next((a['kind'] for a in full_catalog if a['id']==matched),'')=='voice' else 'document')
+                explanation=('L’envoi du '+requested_label+' n’est pas encore confirmé. Je préfère éviter un double envoi.'
                              if uncertain else
-                             'Le document a déjà été envoyé dans cette conversation.' if previously_sent else
-                             'Le document demandé est momentanément indisponible.')
+                             'Ce fichier a déjà été envoyé deux fois dans cette conversation.' if previously_sent else
+                             'Le fichier demandé est momentanément indisponible.')
                 # If a warning is already in the chat, don't flood the
                 # recipient with identical notices on every repeat request.
                 if uncertain:
@@ -652,7 +704,9 @@ def answer_one(db,thread,base_data):
                 # NEVER reuse an apology/handoff or unverified send claim as
                 # the media caption. These words would reach the recruiter.
                 name=next(m['name'] for m in media_catalog if m['media_id']==media_id)
-                answer='Voici le document demandé 😊' if next(m['kind'] for m in media_catalog if m['media_id']==media_id)=='document' else 'Voici le fichier demandé 😊'
+                answer=('Voici le document demandé 😊' if next(m['kind'] for m in media_catalog if m['media_id']==media_id)=='document'
+                        else 'Voici le vocal demandé 😊' if next(m['kind'] for m in media_catalog if m['media_id']==media_id)=='voice'
+                        else 'Voici le fichier demandé 😊')
                 print('[AI attachment review]',thread['worker_id'][:8],
                       'lead',thread['lead_id'],'selected',name,flush=True)
             else:
@@ -660,6 +714,8 @@ def answer_one(db,thread,base_data):
                       'lead',thread['lead_id'],'no matching permitted attachment',flush=True)
         facts=decision_facts(result)
         if media_id:
+            if media_id not in {m['media_id'] for m in media_catalog}:
+                raise ValueError('Gemini chose an attachment not eligible for spontaneous sending')
             db.validate_media_choice(thread,media_id)
         print('[AI attachment decision]',thread['worker_id'][:8],
               'lead',thread['lead_id'], 'selected' if media_id else 'text_only',

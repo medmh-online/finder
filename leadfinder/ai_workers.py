@@ -417,12 +417,28 @@ class WorkerDB:
                 ('AND enabled=1 ' if only_enabled else '')+'ORDER BY created_at,id', (profile_id,))]
 
     def available_media_for_lead(self, profile_id, lead_id):
-        """Hide files already sent/queued/uncertain to this contact from Gemini."""
+        """Permit an explicitly requested second send, never a pending/uncertain send.
+
+        Gemini sees the file as eligible, but the attachment router still has
+        to determine that the latest inbound actually requests this file.
+        Once two sends are confirmed, an operator must take over. An older
+        uncertain attempt superseded by a later confirmed send does not block
+        an explicit second request forever.
+        """
         with self.connect() as c:
-            return [dict(r) for r in c.execute('''SELECT a.* FROM ai_profile_media a WHERE a.profile_id=? AND a.enabled=1
+            return [dict(r) for r in c.execute('''SELECT a.*, (SELECT COUNT(*) FROM ai_messages n
+                    WHERE n.lead_id=? AND n.media_id=a.id AND n.direction='out' AND n.status='sent') AS confirmed_sends
+                FROM ai_profile_media a
+                WHERE a.profile_id=? AND a.enabled=1
                 AND NOT EXISTS (SELECT 1 FROM ai_messages m WHERE m.lead_id=?
-                  AND m.media_id=a.id AND m.status IN ('sent','uncertain','sending','queued_reply'))
-                ORDER BY a.created_at,a.id''',(profile_id,lead_id))]
+                  AND m.media_id=a.id AND m.direction='out'
+                  AND (m.status IN ('sending','queued_reply','queued')
+                       OR (m.status='uncertain' AND m.id > COALESCE(
+                           (SELECT MAX(n.id) FROM ai_messages n WHERE n.lead_id=m.lead_id
+                            AND n.media_id=m.media_id AND n.direction='out' AND n.status='sent'),0))))
+                AND (SELECT COUNT(*) FROM ai_messages m WHERE m.lead_id=?
+                  AND m.media_id=a.id AND m.direction='out' AND m.status='sent') < 2
+                ORDER BY a.created_at,a.id''',(lead_id,profile_id,lead_id,lead_id))]
 
     def media_delivery_state(self, profile_id, lead_id, limit=6):
         # Ground future AI replies in recorded, not assumed, media outcomes.
@@ -458,15 +474,25 @@ class WorkerDB:
                 old=c.execute('''SELECT status FROM ai_messages WHERE lead_id=? AND media_id=?
                       AND direction='out' AND status IN ('sent','uncertain','sending','queued_reply')
                       ORDER BY id DESC LIMIT 1''',(lead_id,f['id'])).fetchone()
-                f['status']=(('already_sent_or_pending: '+old['status']) if old else
-                       'disabled' if not f['enabled'] else 'available')
+                confirmed=c.execute("SELECT COUNT(*) FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status='sent'",
+                                    (lead_id,f['id'])).fetchone()[0]
+                if not f['enabled']:
+                    f['status']='disabled'
+                elif old and old['status'] in ('uncertain','sending','queued_reply'):
+                    f['status']='already_sent_or_pending: '+old['status']
+                elif confirmed>=2:
+                    f['status']='already_sent_twice'
+                elif confirmed==1:
+                    f['status']='available_on_explicit_repeat_request'
+                else:
+                    f['status']='available'
                 if old and old['status']=='uncertain':
                     retry=c.execute('SELECT 1 FROM ai_media_recipient_retries WHERE lead_id=? AND media_id=?',
                         (lead_id,f['id'])).fetchone()
                     f['status']+=(' (recipient recovery attempt already used)' if retry else
                                   ' (one retry may be allowed if recipient explicitly reports non-delivery)')
                 # Do not expose storage paths; just report file readiness.
-                if f['status']=='available':
+                if f['status'] in ('available','available_on_explicit_repeat_request'):
                     saved=media_root()/f['filename']
                     if saved.is_symlink() or not saved.is_file():
                         f['status']='stored_file_missing'
@@ -609,9 +635,17 @@ class WorkerDB:
         if hashlib.sha256(path.read_bytes()).hexdigest()!=media['sha256']:
             raise ValueError('Attachment file integrity mismatch')
         with self.connect() as c:
-            repeat=c.execute("SELECT 1 FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status IN ('sent','uncertain','sending','queued_reply') LIMIT 1",
+            blocked=c.execute("""SELECT 1 FROM ai_messages m WHERE m.lead_id=? AND m.media_id=? AND m.direction='out'
+                AND (m.status IN ('sending','queued_reply','queued') OR
+                     (m.status='uncertain' AND m.id>COALESCE(
+                       (SELECT MAX(n.id) FROM ai_messages n WHERE n.lead_id=m.lead_id
+                        AND n.media_id=m.media_id AND n.direction='out' AND n.status='sent'),0)))
+                LIMIT 1""",
                              (thread['lead_id'],media_id)).fetchone()
-        if repeat: raise ValueError('Attachment already sent or pending for this lead')
+            confirmed=c.execute("SELECT COUNT(*) FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status='sent'",
+                             (thread['lead_id'],media_id)).fetchone()[0]
+        if blocked: raise ValueError('Attachment send pending or unconfirmed for this lead')
+        if confirmed>=2: raise ValueError('Attachment already sent twice to this lead')
         return media
 
     def instruction_profiles(self):
@@ -1360,6 +1394,22 @@ class WorkerDB:
             latest=c.execute('SELECT chat_id FROM ai_messages WHERE lead_id=? AND direction="in" ORDER BY id DESC LIMIT 1',(thread['lead_id'],)).fetchone()
             if not latest:
                 return None
+            if media_id:
+                attachment=c.execute('SELECT id FROM ai_profile_media WHERE id=? AND profile_id=? AND enabled=1',
+                                     (media_id,thread.get('instruction_profile_id'))).fetchone()
+                if not attachment:
+                    return None
+                blocked=c.execute("""SELECT 1 FROM ai_messages m WHERE m.lead_id=? AND m.media_id=? AND m.direction='out'
+                AND (m.status IN ('sending','queued_reply','queued') OR
+                     (m.status='uncertain' AND m.id>COALESCE(
+                       (SELECT MAX(n.id) FROM ai_messages n WHERE n.lead_id=m.lead_id
+                        AND n.media_id=m.media_id AND n.direction='out' AND n.status='sent'),0)))
+                LIMIT 1""",
+                                  (thread['lead_id'],media_id)).fetchone()
+                sent=c.execute("SELECT COUNT(*) FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status='sent'",
+                               (thread['lead_id'],media_id)).fetchone()[0]
+                if blocked or sent>=2:
+                    return None
             c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at,media_id)
                  VALUES(?,?,?,'out',?,'queued_reply',?,?,?)''',(thread['lead_id'],thread['worker_id'],latest['chat_id'],body,now(),now(),media_id))
             identifier=c.execute('SELECT last_insert_rowid()').fetchone()[0]

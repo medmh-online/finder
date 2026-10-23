@@ -81,7 +81,8 @@ class MediaTests(unittest.TestCase):
         with self.db.connect() as c:
             row=c.execute('SELECT status FROM ai_messages WHERE id=?',(identifier,)).fetchone()
         self.assertEqual(row['status'],'sent')
-        with self.assertRaises(ValueError):self.db.validate_media_choice(self.thread,mid)
+        # The first confirmed send is allowed to be explicitly requested once again.
+        self.assertEqual(self.db.validate_media_choice(self.thread,mid)['id'],mid)
     def test_cv_request_does_not_handoff_when_first_model_proposes_it(self):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
