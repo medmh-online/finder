@@ -260,6 +260,17 @@ class WorkerDB:
             msg_cols={x['name'] for x in c.execute('PRAGMA table_info(ai_messages)')}
             if 'media_id' not in msg_cols:
                 c.execute('ALTER TABLE ai_messages ADD COLUMN media_id TEXT')
+            # A one-time, recipient-initiated retry after an UNKNOWN attachment
+            # outcome. Kept separately so the original uncertain attempt remains
+            # an accurate audit record, rather than being rewritten as failed.
+            c.execute('''CREATE TABLE IF NOT EXISTS ai_media_recipient_retries (
+                lead_id INTEGER NOT NULL REFERENCES leads(id) ON DELETE CASCADE,
+                media_id TEXT NOT NULL,
+                original_message_id INTEGER NOT NULL,
+                retry_message_id INTEGER NOT NULL,
+                confirmed_by_inbound_id INTEGER NOT NULL,
+                created_at REAL NOT NULL,
+                PRIMARY KEY(lead_id,media_id))''')
         return self
 
     @staticmethod
@@ -449,6 +460,11 @@ class WorkerDB:
                       ORDER BY id DESC LIMIT 1''',(lead_id,f['id'])).fetchone()
                 f['status']=(('already_sent_or_pending: '+old['status']) if old else
                        'disabled' if not f['enabled'] else 'available')
+                if old and old['status']=='uncertain':
+                    retry=c.execute('SELECT 1 FROM ai_media_recipient_retries WHERE lead_id=? AND media_id=?',
+                        (lead_id,f['id'])).fetchone()
+                    f['status']+=(' (recipient recovery attempt already used)' if retry else
+                                  ' (one retry may be allowed if recipient explicitly reports non-delivery)')
                 # Do not expose storage paths; just report file readiness.
                 if f['status']=='available':
                     saved=media_root()/f['filename']
@@ -494,6 +510,57 @@ class WorkerDB:
             self._trace_in_tx(c,row['lead_id'],worker_id,'media_retry_unlocked',
                               'Operator verified absent WhatsApp attachment; no resend queued')
             return True
+
+    def queue_recipient_confirmed_media_retry(self, thread, media_id, caption):
+        '''One controlled automatic retry if the *recipient* says file absent.
+
+        Not triggered by a timeout, send failure, or the AI's own assertion.
+        Caller must obtain a semantic structured decision about the latest
+        recipient message. Database uniqueness allows at most one retry per
+        lead/file until an operator explicitly intervenes. Unknown original
+        deliveries remain UNKNOWN in the audit; a duplicate is still possible.
+        '''
+        from .ai_media import media_root
+        import hashlib
+        lead_id=int(thread['lead_id'])
+        if not caption or len(caption)>3000:raise ValueError('Invalid attachment caption')
+        with self.connect(True) as c:
+            w=c.execute('SELECT instruction_profile_id,enabled FROM ai_workers WHERE id=?',
+                (thread['worker_id'],)).fetchone()
+            t=c.execute('SELECT instruction_profile_id FROM ai_threads WHERE lead_id=?',(lead_id,)).fetchone()
+            a=c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?',(lead_id,)).fetchone()
+            latest=c.execute("SELECT id,chat_id,created_at FROM ai_messages WHERE lead_id=? AND direction='in' ORDER BY id DESC LIMIT 1",(lead_id,)).fetchone()
+            m=c.execute('SELECT * FROM ai_profile_media WHERE id=?',(media_id,)).fetchone()
+            if (not w or not w['enabled'] or not t or not a or a['worker_id']!=thread['worker_id']
+                or not latest or latest['id']!=thread['latest_inbound_id']
+                or t['instruction_profile_id']!=w['instruction_profile_id']
+                or w['instruction_profile_id']!=thread['instruction_profile_id']
+                or not m or not m['enabled'] or m['profile_id']!=thread['instruction_profile_id']):
+                return None
+            if c.execute('SELECT 1 FROM ai_lead_control WHERE lead_id=? AND (paused=1 OR handoff=1)',(lead_id,)).fetchone():return None
+            if c.execute('SELECT 1 FROM ai_media_recipient_retries WHERE lead_id=? AND media_id=?',(lead_id,media_id)).fetchone():return None
+            if c.execute("SELECT 1 FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status IN ('sent','sending','queued_reply')",(lead_id,media_id)).fetchone():return None
+            prior=c.execute('''SELECT id,created_at FROM ai_messages
+                WHERE lead_id=? AND worker_id=? AND media_id=? AND direction='out' AND status='uncertain'
+                ORDER BY id DESC LIMIT 1''',(lead_id,thread['worker_id'],media_id)).fetchone()
+            if not prior or latest['id']<=prior['id'] or now()-prior['created_at']<45:
+                return None
+            path=media_root()/m['filename']
+            if (path.is_symlink() or not path.is_file() or
+                path.stat().st_size!=m['file_size'] or
+                hashlib.sha256(path.read_bytes()).hexdigest()!=m['sha256']):
+                raise ValueError('Attachment file is not readable or integrity check failed')
+            c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at,media_id)
+                VALUES(?,?,?,'out',?,'queued_reply',?,?,?)''',
+                (lead_id,thread['worker_id'],latest['chat_id'],caption,now(),now(),media_id))
+            queued=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            c.execute('''INSERT INTO ai_media_recipient_retries
+                (lead_id,media_id,original_message_id,retry_message_id,confirmed_by_inbound_id,created_at)
+                VALUES(?,?,?,?,?,?)''',(lead_id,media_id,prior['id'],queued,latest['id'],now()))
+            c.execute('UPDATE ai_threads SET replied_through=?,retry_after=0 WHERE lead_id=?',(latest['id'],lead_id))
+            self._trace_in_tx(c,lead_id,thread['worker_id'],'recipient_retry_queued',
+                'Recipient reported file absent; one guarded retry queued. Original send remains uncertain.')
+            return queued
 
     def media_record(self, media_id):
         with self.connect() as c:
@@ -1441,13 +1508,21 @@ class WorkerDB:
     def outgoing_sync(self,worker_id,event_id,chat_id,body,sent_at=None,sender_phone=''):
         """Capture manual WhatsApp sends without duplicating app-sent messages."""
         with self.connect(True) as c:
-            existing=c.execute('SELECT id,lead_id,status,worker_id,direction FROM ai_messages WHERE event_id=?',
+            existing=c.execute('SELECT id,lead_id,status,worker_id,direction,media_id FROM ai_messages WHERE event_id=?',
                                 (event_id,)).fetchone()
             if existing:
                 if existing['worker_id']==worker_id and existing['direction']=='out' and existing['status']=='uncertain':
                     c.execute('UPDATE ai_messages SET status="sent" WHERE id=?',(existing['id'],))
                     if existing['lead_id'] is not None:
                         c.execute('UPDATE ai_threads SET last_outbound=? WHERE lead_id=?',(now(),existing['lead_id']))
+                        if existing['media_id']:
+                            # A late server ACK for the original uncertain CV
+                            # must cancel any not-yet-dispatched recipient retry.
+                            c.execute('''UPDATE ai_messages SET status='superseded' WHERE
+                                id IN (SELECT retry_message_id FROM ai_media_recipient_retries
+                                       WHERE lead_id=? AND media_id=? AND original_message_id=?)
+                                AND status='queued_reply' ''',
+                                (existing['lead_id'],existing['media_id'],existing['id']))
                     return existing['lead_id']
                 return None
             if c.execute('SELECT 1 FROM ai_unmatched WHERE event_id=?',(event_id,)).fetchone():
@@ -1459,7 +1534,7 @@ class WorkerDB:
             lead_id=lead['id']
             matched=c.execute("""SELECT id FROM ai_messages WHERE lead_id=? AND worker_id=? AND
                       direction='out' AND chat_id=? AND body=? AND created_at>? AND
-                      status IN ('queued','queued_reply','sending','uncertain','sent')
+                      media_id IS NULL AND status IN ('queued','queued_reply','sending','uncertain','sent')
                       ORDER BY id DESC LIMIT 1""",
                       (lead_id,worker_id,chat_id,body,now()-120)).fetchone()
             if matched:

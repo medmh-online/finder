@@ -145,7 +145,11 @@ def parse_media_router(result, allowed_ids):
         raise ValueError('Attachment router chose an unknown media ID')
     if not decision['file_requested'] and selection:
         raise ValueError('Attachment router selected a file without a request')
-    return decision['file_requested'],decision['human_required'],selection
+    recipient_missing=decision.get('recipient_confirms_no_delivery',False)
+    if type(recipient_missing) is not bool:raise ValueError('Invalid missing-delivery classification')
+    if recipient_missing and not decision['file_requested']:
+        raise ValueError('Cannot confirm missing delivery without a matching attachment request')
+    return decision['file_requested'],decision['human_required'],selection,recipient_missing
 
 
 def route_incoming_attachment(db,worker,base_data,thread,mission,messages,all_media,available_ids):
@@ -168,11 +172,18 @@ def route_incoming_attachment(db,worker,base_data,thread,mission,messages,all_me
         'A CV or portfolio request alone never requires human handoff. '
         'Set human_required=true ONLY if the customer additionally asks for a human, interview, '
         'meeting, salary negotiation, binding decision, or something requiring the profile owner. '
-        'If a matching file is unavailable, still select its file ID; Python will NOT send it. '
+        'If a matching file is unavailable, still select its ID; Python validates status. '
+        'Set recipient_confirms_no_delivery=true ONLY if this incoming message EXPLICITLY says '
+        'the recipient did not receive the previously requested attachment. '
+        'Merely repeating send me the CV is NOT confirmation of non-delivery. '
+        'A message saying I received nothing is confirmation when it clearly refers to the attachment. '
         'Do not infer file requests from greetings or unrelated context. '
-        'Return ONLY strict JSON: {"file_requested":false,"human_required":false,"media_id":null}. '
+        'Return ONLY strict JSON: {"file_requested":false,"human_required":false,"media_id":null,"recipient_confirms_no_delivery":false}. '
         'When file_requested=true return the matching ID, or null if no saved file matches. '
         'FILES: '+json.dumps(catalog,ensure_ascii=False)[:5000]+'\n'
+        'RECORDED PRIOR SEND ATTEMPTS: '+json.dumps(
+            db.media_delivery_state(thread.get('instruction_profile_id'),thread['lead_id']),
+            ensure_ascii=False)[:1800]+'\n'
         'ACTIVE PROFILE: '+mission[:2300]+'\n'
         'LATEST MESSAGE: '+json.dumps(current[:900],ensure_ascii=False)
     )
@@ -501,7 +512,7 @@ def answer_one(db,thread,base_data):
     if db.media_for_profile(thread.get('instruction_profile_id'),only_enabled=False):
         try:
             full_catalog=db.media_for_profile(thread.get('instruction_profile_id'),only_enabled=False)
-            requested,human_required,matched=route_incoming_attachment(
+            requested,human_required,matched,recipient_missing=route_incoming_attachment(
                 db,worker,base_data,thread,mission,messages,full_catalog,
                 {m['id'] for m in permitted_media})
             print('[AI media router]',thread['worker_id'][:8], 'lead',thread['lead_id'],
@@ -515,8 +526,21 @@ def answer_one(db,thread,base_data):
                              else 'Voici le fichier demandé 😊')
                     db.commit_reply(thread,caption,media_id=matched)
                     return
+                # A recipient's explicit non-delivery report permits ONE
+                # guarded retry. This is not triggered just by re-requesting
+                # the CV, and is never triggered by an internal timeout alone.
+                if recipient_missing and matched:
+                    selected=next((a for a in full_catalog if a['id']==matched),None)
+                    if selected and selected['enabled']:
+                        caption=('Voici le document demandé 😊' if selected['kind']=='document'
+                                 else 'Voici le fichier demandé 😊')
+                        retried=db.queue_recipient_confirmed_media_retry(thread,matched,caption)
+                        if retried:
+                            print('[AI attachment recipient retry]',thread['worker_id'][:8],
+                                  'lead',thread['lead_id'],'queued',retried,flush=True)
+                            return
                 # A previous attempt may be uncertain. Never pretend delivery
-                # or re-send without the operator checking the real chat.
+                # or send an unbounded stream of retry attempts.
                 # Even if the file is disabled, missing or blocked by an old
                 # uncertain send, asking for a CV is not a human handoff.
                 # Never let a generic Gemini reply promise a delivery or
@@ -529,6 +553,14 @@ def answer_one(db,thread,base_data):
                              if uncertain else
                              'Le document a déjà été envoyé dans cette conversation.' if previously_sent else
                              'Le document demandé est momentanément indisponible.')
+                # If a warning is already in the chat, don't flood the
+                # recipient with identical notices on every repeat request.
+                if uncertain:
+                    prior_warnings=[m for m in messages if m.get('direction')=='out' and
+                                    m.get('body','').strip()==explanation]
+                    if prior_warnings:
+                        db.acknowledge_inbound(thread)
+                        return
                 db.commit_reply(thread,explanation)
                 return
         except ValueError as route_exc:

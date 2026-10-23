@@ -214,7 +214,7 @@ def render_workers(access,repo):
                     for item in report['files']:
                         st.write(item['display_name']+' ('+item['kind']+') — '+item['status'])
                     if any('uncertain' in item['status'] for item in report['files']):
-                        st.info('An earlier send is unconfirmed. First check WhatsApp to ensure '
+                        st.info('An earlier send is unconfirmed. An explicit non-delivery report from the recipient may allow one guarded retry. Otherwise first check WhatsApp to ensure '
                                 'the file did NOT arrive, then unlock that attempt under Media send status below.')
                 except (ValueError,OSError) as exc:
                     st.error(str(exc))
@@ -243,7 +243,7 @@ def render_workers(access,repo):
                 st.warning('Upload and enable a file on this worker’s active profile first.')
         with st.expander('Media send status · verify attachments in WhatsApp'):
             st.caption('Confirmed means the gateway returned a WhatsApp message ID, not proof the recipient read it. '
-                       'Unconfirmed means delivery is unknown. MEDMH will not automatically retry an unconfirmed file.')
+                       'Unconfirmed means delivery is unknown. MEDMH never retries a timeout alone. One guarded attempt is possible if the recipient explicitly says they did not receive the file, subject to active-profile and duplicate checks.')
             media_attempts=db.recent_worker_media_delivery(picked)
             if not media_attempts:
                 st.caption('No attachment sends recorded for this worker yet. If Gemini only sent text, check '
