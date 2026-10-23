@@ -192,6 +192,32 @@ def render_workers(access,repo):
                         daily_token_limit=int(token_limit),reply_delay_min=int(delay_min),reply_delay_max=int(delay_max))
                     st.success('Saved');st.rerun()
                 except ValueError as exc:st.error(str(exc))
+        with st.expander('Check why a lead cannot receive uploaded media'):
+            st.caption('This is read-only and does not send or retry any file. '
+                       'Use the lead number from the Leads table; upload to the profile activated for this worker.')
+            lead_number=st.number_input('Lead ID for attachment readiness',min_value=1,
+                value=1,step=1,key='ai_media_readiness_lead_'+picked)
+            if st.button('Check attachment readiness',key='ai_media_readiness_check_'+picked):
+                try:
+                    report=db.media_readiness_for_lead(picked,int(lead_number))
+                    st.write('Active worker profile:',report['active_profile'])
+                    if not report['thread_profile_matches_worker']:
+                        st.warning('This lead conversation belongs to another instruction profile. '
+                                   'Switch the worker to that profile or use a new test lead.')
+                    if report['lead_handoff']:
+                        st.warning('The AI already handed this lead off. It will not reply until you explicitly resume the lead.')
+                    if report['lead_paused']:
+                        st.warning('The AI is paused for this lead.')
+                    if not report['files']:
+                        st.error('No file has been uploaded to the active profile. '
+                                 'Select the active profile above and upload the CV PDF there.')
+                    for item in report['files']:
+                        st.write(item['display_name']+' ('+item['kind']+') — '+item['status'])
+                    if any('uncertain' in item['status'] for item in report['files']):
+                        st.info('An earlier send is unconfirmed. First check WhatsApp to ensure '
+                                'the file did NOT arrive, then unlock that attempt under Media send status below.')
+                except (ValueError,OSError) as exc:
+                    st.error(str(exc))
         with st.expander('Media send status · verify attachments in WhatsApp'):
             st.caption('Confirmed means the gateway returned a WhatsApp message ID, not proof the recipient read it. '
                        'Unconfirmed means delivery is unknown. MEDMH will not automatically retry an unconfirmed file.')

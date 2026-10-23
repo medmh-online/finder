@@ -82,25 +82,77 @@ class MediaTests(unittest.TestCase):
             row=c.execute('SELECT status FROM ai_messages WHERE id=?',(identifier,)).fetchone()
         self.assertEqual(row['status'],'sent')
         with self.assertRaises(ValueError):self.db.validate_media_choice(self.thread,mid)
-    def test_gemini_auto_selects_uploaded_cv_and_hands_off(self):
+    def test_cv_request_does_not_handoff_when_first_model_proposes_it(self):
         mid,_=self.upload()
-        worker_model=self.db.worker(self.worker)
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**k:True
+        drafts=[json.dumps({'action':'handoff','reply':'Voici le CV. Mohammed prendra le relais.',
+                'media_id':mid,'media_requested':True}),
+                json.dumps({'requested_matching_file':True,'media_id':mid})]
         prompts=[]
         def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
             prompts.append(prompt)
-            return json.dumps({'action':'handoff','reply':'Voici son CV. Mohammed vous contactera directement.',
-                'media_id':mid,'qualification':{'service':'Developer recruitment'}}),{}
+            return drafts.pop(0),{}
         with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
-        self.assertTrue(prompts)
-        self.assertIn(mid,prompts[0])
+        self.assertEqual(len(prompts),2)
+        self.assertIn('independent attachment-routing verifier',prompts[1])
         with self.db.connect() as c:
-            r=c.execute("SELECT kind,media_id FROM ai_messages WHERE direction='out'").fetchone()
-            handoff=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()[0]
-        self.assertEqual((r['kind'],r['media_id'],handoff),('handoff',mid,1))
+            r=c.execute("SELECT kind,media_id,body FROM ai_messages WHERE direction='out'").fetchone()
+            handoff=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
+        self.assertEqual(r['media_id'],mid)
+        self.assertNotEqual(r['kind'],'handoff')
+        self.assertNotIn('prendra le relais',r['body'])
+        self.assertFalse(handoff and handoff['handoff'])
         self.assertEqual(self.db.available_media_for_lead(self.profile,1),[])
+
+    def test_false_cannot_attach_claim_gets_independent_media_review(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**k:True
+        drafts=[json.dumps({'action':'reply','reply':'Désolé, je ne peux pas joindre le CV actuellement.',
+                             'media_id':None}),
+                json.dumps({'requested_matching_file':True,'media_id':mid})]
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=lambda *a,**k:(drafts.pop(0),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            out=c.execute("SELECT body,media_id,status FROM ai_messages WHERE direction='out'").fetchone()
+        self.assertEqual(out['media_id'],mid)
+        self.assertEqual(out['status'],'queued_reply')
+        self.assertNotIn('peux pas',out['body'])
+
+    def test_media_review_does_not_override_real_interview_handoff(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**k:True
+        drafts=[json.dumps({'action':'handoff','reply':'Mohammed vous appellera personnellement.',
+                             'media_id':None}),
+                json.dumps({'requested_matching_file':False,'media_id':None})]
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=lambda *a,**k:(drafts.pop(0),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            out=c.execute("SELECT kind,media_id FROM ai_messages WHERE direction='out'").fetchone()
+            handoff=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
+        self.assertEqual(out['kind'],'handoff')
+        self.assertIsNone(out['media_id'])
+        self.assertTrue(handoff['handoff'])
+
+    def test_readiness_explains_uncertain_and_profile_mismatch(self):
+        mid,_=self.upload()
+        first=self.db.media_readiness_for_lead(self.worker,1)
+        self.assertEqual(first['files'][0]['status'],'available')
+        self.assertTrue(first['thread_profile_matches_worker'])
+        out=self.db.commit_reply(self.thread,'Voici le CV',media_id=mid)
+        self.db.status(out,'uncertain')
+        flagged=self.db.media_readiness_for_lead(self.worker,1)
+        self.assertIn('uncertain',flagged['files'][0]['status'])
+        self.db.unlock_unconfirmed_media(self.worker,out)
+        self.assertEqual(self.db.media_readiness_for_lead(self.worker,1)['files'][0]['status'],'available')
+        self.db.activate_instruction_profile(self.worker,'legacy-medmh')
+        changed=self.db.media_readiness_for_lead(self.worker,1)
+        self.assertFalse(changed['thread_profile_matches_worker'])
+        self.assertEqual(changed['files'],[])
+
 
     def test_switch_blocks_old_profile_media(self):
         mid,_=self.upload()

@@ -423,6 +423,49 @@ class WorkerDB:
                 AND m.status IN ('sent','uncertain','queued_reply','sending','failed','blocked')
                 ORDER BY m.id DESC LIMIT ?''',(profile_id,lead_id,int(limit)))]
 
+    def media_readiness_for_lead(self, worker_id, lead_id):
+        '''Local operator diagnostics; never return files from another worker.
+
+        No database writes, WhatsApp sends, or automatic retries. The status
+        answers whether Gemini *can* select a profile attachment for this lead.
+        '''
+        from .ai_media import media_root
+        import hashlib
+        worker=self.worker(worker_id)
+        if not worker:
+            raise ValueError('Worker does not exist')
+        lead_id=int(lead_id)
+        with self.connect() as c:
+            assigned=c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?',(lead_id,)).fetchone()
+            if not assigned or assigned['worker_id']!=worker_id:
+                raise ValueError('This lead is not assigned to the selected worker')
+            thread=c.execute('SELECT instruction_profile_id FROM ai_threads WHERE lead_id=?',(lead_id,)).fetchone()
+            ctrl=c.execute('SELECT paused,handoff FROM ai_lead_control WHERE lead_id=?',(lead_id,)).fetchone()
+            files=[dict(x) for x in c.execute('''SELECT id,display_name,filename,enabled,kind,file_size,sha256 FROM ai_profile_media
+                   WHERE profile_id=? ORDER BY created_at''',(worker.get('instruction_profile_id'),))]
+            for f in files:
+                old=c.execute('''SELECT status FROM ai_messages WHERE lead_id=? AND media_id=?
+                      AND direction='out' AND status IN ('sent','uncertain','sending','queued_reply')
+                      ORDER BY id DESC LIMIT 1''',(lead_id,f['id'])).fetchone()
+                f['status']=(('already_sent_or_pending: '+old['status']) if old else
+                       'disabled' if not f['enabled'] else 'available')
+                # Do not expose storage paths; just report file readiness.
+                if f['status']=='available':
+                    saved=media_root()/f['filename']
+                    if saved.is_symlink() or not saved.is_file():
+                        f['status']='stored_file_missing'
+                    elif (saved.stat().st_size != f['file_size'] or
+                          hashlib.sha256(saved.read_bytes()).hexdigest() != f['sha256']):
+                        f['status']='stored_file_corrupted'
+                for hidden in ('filename','enabled','id','file_size','sha256'):
+                    f.pop(hidden,None)
+        return {'active_profile':self.instruction_profile(worker.get('instruction_profile_id'))['name']
+                    if worker.get('instruction_profile_id') and self.instruction_profile(worker['instruction_profile_id']) else '(none)',
+                'thread_profile_matches_worker':bool(thread and thread['instruction_profile_id']==worker.get('instruction_profile_id')),
+                'lead_handoff':bool(ctrl and ctrl['handoff']),
+                'lead_paused':bool(ctrl and ctrl['paused']),
+                'files':files}
+
     def recent_worker_media_delivery(self, worker_id, limit=20):
         # Do not reveal files/contacts from another worker in the controls UI.
         with self.connect() as c:

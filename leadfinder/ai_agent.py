@@ -83,6 +83,50 @@ def parse_ai_decision(result):
     return 'reply',clean
 
 
+def media_request_declared(result):
+    """Read Gemini's semantic indication, not a keyword check on customer text."""
+    clean=str(result or '').strip()
+    if clean.startswith('```'):
+        clean=clean.split('\n',1)[-1].rsplit('```',1)[0].strip()
+    try:
+        payload=json.loads(clean)
+    except (ValueError,TypeError):
+        return False
+    return isinstance(payload,dict) and payload.get('media_requested') is True
+
+
+def media_unavailable_excuse(reply):
+    """Detect a contradiction for REVIEW, not to select any document.
+
+    Gemini alone decides whether the contact really requested a file.
+    """
+    import unicodedata
+    s=''.join(c for c in unicodedata.normalize('NFKD',str(reply or '').casefold())
+              if not unicodedata.combining(c))
+    return bool(re.search(r'(?:cv|pdf|document|attachment|fichier|piece jointe|media|file)',s)
+                and re.search(r'(?:peux pas|impossible|indisponible|not available|cannot|can.t|unable|souci technique|probleme technique|technical issue)',s))
+
+
+def independent_media_review(result):
+    """Parse a second, narrowly focused Gemini decision.
+
+    This review may only select a catalog item. It cannot name a file path,
+    override access rules, or automatically retry a prior WhatsApp attempt.
+    """
+    clean=str(result or '').strip()
+    if clean.startswith('```'):
+        clean=clean.split('\n',1)[-1].rsplit('```',1)[0].strip()
+    payload=json.loads(clean)
+    if not isinstance(payload,dict) or type(payload.get('requested_matching_file')) is not bool:
+        raise ValueError('Invalid Gemini media review')
+    if not payload['requested_matching_file']:
+        return None
+    value=payload.get('media_id')
+    if value is not None and (not isinstance(value,str) or not re.fullmatch('[0-9a-f]{32}',value)):
+        raise ValueError('Invalid Gemini media review identifier')
+    return value
+
+
 def decision_media_id(result):
     """Only opaque IDs are accepted, never Gemini-supplied file paths."""
     clean=str(result or '').strip()
@@ -370,9 +414,10 @@ def answer_one(db,thread,base_data):
       "You MAY select one approved uploaded attachment by media_id when it is useful and complies with its send_when instructions. "
       "File sending is automatic: do not ask for owner approval. Never select a file ID not listed in ALLOWED MEDIA. "
       "Only ONE file per reply. Do not resend the same file to the same contact. Do not send unsolicited CVs unless its media instructions allow it. "
-      "A request for a CV or portfolio alone is NOT a handoff. If the profile allows it, choose action=reply WITH the matching media_id; continue the chat afterward. "
+      "A request for a CV or portfolio alone is NOT a handoff. If the profile allows it, you MUST choose action=reply WITH the matching media_id; continue the chat afterward. "
       "IMPORTANT: NEVER claim 'voici/voilà le CV', 'attached', or that you have sent a file unless the SAME JSON reply contains its permitted media_id. "
       "When media_id is null, your reply is TEXT ONLY; it is NOT a file delivery, even if you mentioned a CV previously. "
+      "A saved media file IS AVAILABLE when it is listed in ALLOWED MEDIA: do NOT apologize that you cannot attach it or redirect to a website when it matches the request. "
       "If no matching media is available, state truthfully that the document cannot be attached right now. "
       "An unconfirmed prior attachment attempt is NOT proof of delivery OR that no file exists. Do not retry it automatically; say its delivery is unconfirmed. "
       "A selected attachment is sent by the app, NOT by Gemini; never treat the proposed reply text as confirmation of actual WhatsApp delivery. "
@@ -381,7 +426,8 @@ def answer_one(db,thread,base_data):
       "For other ordinary replies do not promise a human follow-up; use handoff/complete instead. "
       "Keep qualification facts concise and only from the conversation, using service as the kind of opportunity, "
       "requirements as main request, and optional budget/deadline only if stated. "
-      "Respond ONLY with JSON: {\"action\":\"reply|ignore|stop|handoff|complete\",\"reply\":\"short text\","
+      "Declare media_requested=true when the contact is requesting an allowed uploaded file. "
+      "Respond ONLY with JSON: {\"action\":\"reply|ignore|stop|handoff|complete\",\"reply\":\"short text\",\"media_requested\":false,"
       "\"media_id\":null,\"qualification\":{\"service\":\"\",\"requirements\":\"\",\"budget\":\"\",\"deadline\":\"\"}}. "
       f"ALLOWED MEDIA (use only these IDs, or null): {json.dumps(media_catalog,ensure_ascii=False)[:2600]}. "
       f"PREVIOUS FILE ATTEMPTS (status sent means send was confirmed; uncertain means NOT verified): {json.dumps(media_history,ensure_ascii=False)[:1000]}. "
@@ -429,6 +475,55 @@ def answer_one(db,thread,base_data):
         if ((media_catalog and not valid_structured_media_decision(result)) or
                 (not media_id and attachment_claim_without_file(answer))):
             raise ValueError('AI promised to send an attachment without selecting an approved media_id')
+        # A structured first response may still refuse a perfectly available
+        # attachment, or unnecessarily hand off a routine CV request. Ask Gemini
+        # to judge the latest inbound message and catalog independently.
+        # No lexical customer-message matcher or automatic network retry.
+        if media_catalog and ((not media_id and (media_request_declared(result) or
+                media_unavailable_excuse(answer))) or action in ('handoff','complete')):
+            latest_inbound=next((m.get('body','') for m in reversed(messages)
+                                 if m.get('direction')=='in'),'')
+            review_instruction=(
+                'You are an independent attachment-routing verifier for a WhatsApp AI. '
+                'Review the CURRENT customer message and the saved profile media rules. '
+                'Does the CURRENT message request ONE of these exact approved attachments? '
+                'If yes, return the matching allowed media_id; do not treat a routine CV request as a human handoff. '
+                'A PDF can be sent by the app, so do not assume a technical limitation. '
+                'If they also explicitly request a human, interview, or personal decision, return requested_matching_file=false '
+                'so the existing human handoff can proceed. '
+                'Return ONLY JSON: {"requested_matching_file":true|false,"media_id":"id or null"}. '
+                'Available media: '+json.dumps(media_catalog,ensure_ascii=False)[:3000]+'\n'
+                'Active profile: '+mission[:2000]+'\n'
+                'Current customer message: '+json.dumps(latest_inbound[:900],ensure_ascii=False)+'\n'
+                'Initial AI draft (not sent): '+json.dumps({'action':action,'reply':answer},ensure_ascii=False)[:800]
+            )
+            reviewed,_=gemini_with_fallback(db,worker,base_data,review_instruction,
+                [{'role':'user','parts':[{'text':'Decide if the latest customer message specifically requests an uploaded file.'}]}],
+                max_tokens=220,purpose='reply',lead_id=thread['lead_id'])
+            reviewed_id=independent_media_review(reviewed)
+            # Gemini made the semantic decision that this request matches an
+            # uploaded file. If precisely one file is eligible but it omitted
+            # the ID, the backend can select that one approved identifier.
+            if reviewed_id is None and len(media_catalog)==1:
+                clean_review=reviewed.strip()
+                if clean_review.startswith('```'):
+                    clean_review=clean_review.split('\n',1)[-1].rsplit('```',1)[0].strip()
+                if json.loads(clean_review).get('requested_matching_file') is True:
+                    reviewed_id=media_catalog[0]['media_id']
+            if reviewed_id is not None:
+                if reviewed_id not in {m['media_id'] for m in media_catalog}:
+                    raise ValueError('Gemini media review chose unauthorized file')
+                media_id=reviewed_id
+                action='reply'
+                # NEVER reuse an apology/handoff or unverified send claim as
+                # the media caption. These words would reach the recruiter.
+                name=next(m['name'] for m in media_catalog if m['media_id']==media_id)
+                answer='Voici le document demandé 😊' if next(m['kind'] for m in media_catalog if m['media_id']==media_id)=='document' else 'Voici le fichier demandé 😊'
+                print('[AI attachment review]',thread['worker_id'][:8],
+                      'lead',thread['lead_id'],'selected',name,flush=True)
+            else:
+                print('[AI attachment review]',thread['worker_id'][:8],
+                      'lead',thread['lead_id'],'no matching permitted attachment',flush=True)
         facts=decision_facts(result)
         if media_id:
             db.validate_media_choice(thread,media_id)
