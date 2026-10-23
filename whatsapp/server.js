@@ -11,7 +11,10 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { Client, NoAuth, MessageMedia } = require('whatsapp-web.js');
+const { loadWhatsAppWithMediaFix } = require('./compat/media_id_fix');
+const { sdk: whatsAppSDK, mediaCompatibility } = loadWhatsAppWithMediaFix();
+const { Client, NoAuth, MessageMedia } = whatsAppSDK;
+console.log('[WhatsApp media compatibility]',mediaCompatibility.status,mediaCompatibility.error || '');
 
 const host = '127.0.0.1';
 const port = 8767;
@@ -505,6 +508,8 @@ async function handler(req,res) {
         return respond(res,400,{error:'invalid chat or message'});
       let validatedMedia=null;
       if(mediaFile){
+        if (!['patched_in_memory','already_fixed'].includes(mediaCompatibility.status))
+          return respond(res,503,{error:'WhatsApp media compatibility unavailable: '+mediaCompatibility.error});
         if(!/^[0-9a-f]{32}\.(pdf|png|jpg|webp|ogg)$/.test(mediaFile) ||
            !['document','image','voice'].includes(mediaKind) ||
            !/^[0-9a-f]{64}$/.test(mediaSha))

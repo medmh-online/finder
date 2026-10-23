@@ -124,4 +124,26 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(deleted,filename)
         remove_file(filename)
         self.assertFalse((media_root()/filename).exists())
+    def test_requested_cv_remains_active_and_queues_media(self):
+        mid, _ = self.upload()
+        self.db.working_models = lambda wid: ['model1']
+        self.db.token_budget_available = lambda *a, **k: True
+        prompts = []
+        def fake_gen(db, worker, base, prompt, dialogue, **kwargs):
+            prompts.append(prompt)
+            return json.dumps({'action':'reply','reply':'Voici son CV. Avez-vous des questions ?',
+                'media_id':mid,'qualification':{'service':'Recruitment'}}), {}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        self.assertTrue(prompts)
+        self.assertIn('A request for a CV or portfolio alone is NOT a handoff',prompts[0])
+        self.assertNotIn('person requests a human, CV, interview',prompts[0])
+        with self.db.connect() as conn:
+            msg=conn.execute("SELECT kind,media_id,status FROM ai_messages WHERE direction='out'").fetchone()
+            ctrl=conn.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
+        self.assertEqual(msg['media_id'],mid)
+        self.assertEqual(msg['status'],'queued_reply')
+        self.assertNotEqual(msg['kind'],'handoff')
+        self.assertFalse(ctrl and ctrl['handoff'])
+
 if __name__=='__main__':unittest.main()
