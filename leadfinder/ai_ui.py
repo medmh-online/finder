@@ -192,6 +192,26 @@ def render_workers(access,repo):
                         daily_token_limit=int(token_limit),reply_delay_min=int(delay_min),reply_delay_max=int(delay_max))
                     st.success('Saved');st.rerun()
                 except ValueError as exc:st.error(str(exc))
+        with st.expander('Media send status · verify attachments in WhatsApp'):
+            st.caption('Confirmed means the gateway returned a WhatsApp message ID, not proof the recipient read it. '
+                       'Unconfirmed means delivery is unknown. MEDMH will not automatically retry an unconfirmed file.')
+            media_attempts=db.recent_worker_media_delivery(picked)
+            if not media_attempts:
+                st.caption('No attachment sends recorded for this worker yet. If Gemini only sent text, check '
+                           'that a file was uploaded to the active profile and watch the [AI attachment decision] log.')
+            for attempt in media_attempts:
+                st.write(f"Lead #{attempt['lead_id']} · {attempt['display_name']} · {attempt['status']}")
+                if attempt['status']=='uncertain':
+                    verified=st.checkbox('I checked the recipient chat and this file did NOT arrive',
+                        key='ai_media_absent_'+str(attempt['message_id']))
+                    if st.button('Allow future AI resend for this file',
+                        key='ai_media_unlock_'+str(attempt['message_id']),disabled=not verified):
+                        try:
+                            access.require()
+                            db.unlock_unconfirmed_media(picked,attempt['message_id'])
+                            st.success('Unlocked. No message has been sent. A later eligible reply may select this file again.')
+                            st.rerun()
+                        except ValueError as exc:st.error(str(exc))
         st.subheader('AI usage · recent 14 days')
         logs=db.usage(picked,limit=2000)
         if logs:

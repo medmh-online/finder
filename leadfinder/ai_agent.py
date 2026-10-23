@@ -15,11 +15,49 @@ from .ai_outreach import GlobalContactLedger
 
 
 def human_history(messages):
-    # Label source explicitly; untrusted WhatsApp messages cannot instruct the
-    # agent to override rules or reveal keys.
-    return [{'role':'user' if m['direction']=='in' else 'model',
-             'parts':[{'text':str(m['body'])[:750]}]}
-             for m in messages if m['status'] not in ('failed','blocked','uncertain','superseded')]
+    """Describe WhatsApp delivery truthfully; a text reply is not a file upload.
+
+    Unconfirmed and queued outbound messages are not presented as delivered
+    history. Confirmed text-only replies get an explicit non-media annotation so
+    Gemini cannot infer a CV/PDF was sent from 'Voici son CV' alone.
+    """
+    result=[]
+    for m in messages:
+        if m['status'] in ('failed','blocked','uncertain','superseded','sending','queued_reply','queued'):
+            continue
+        body=str(m.get('body') or '')[:750]
+        if m['direction']=='out':
+            body += (' [WhatsApp send confirmed; approved attachment included]'
+                     if m.get('media_id') else
+                     ' [WhatsApp text message ONLY; no file or attachment was sent]')
+        result.append({'role':'user' if m['direction']=='in' else 'model',
+                       'parts':[{'text':body}]})
+    return result
+
+
+def attachment_claim_without_file(text):
+    """Safety check only: don't let a draft promise media without a media ID.
+
+    This is NOT used for greetings, lead qualification, or deciding which media
+    to send. Gemini makes the attachment decision; this blocks unsupported
+    delivery claims when its structured attachment selection is missing.
+    """
+    import unicodedata
+    value=''.join(c for c in unicodedata.normalize('NFKD',str(text or '').casefold())
+                  if not unicodedata.combining(c))
+    file_terms=r'(?:cv|resume|pdf|fichier|piece jointe|document|image|photo|audio|vocal|voice note|file|attachment)'
+    promise_terms=r'(?:voici|voila|ci.joint|en piece jointe|je vous envoie|je t.envoie|j.ai envoye|je viens d.envoyer|fichier joint|attached|here is|here are|i.sent|i.ve sent|i.ve attached|sending you|sift lik|sfet lik)'
+    return bool(re.search(r'\b'+file_terms+r'\b',value) and re.search(r'\b'+promise_terms+r'\b',value))
+
+
+def valid_structured_media_decision(result):
+    """Media-capable replies must use the JSON tool-action contract."""
+    clean=str(result or '').strip()
+    if clean.startswith('```'):
+        clean=clean.split('\n',1)[-1].rsplit('```',1)[0].strip()
+    try: payload=json.loads(clean)
+    except (TypeError,ValueError):return False
+    return isinstance(payload,dict) and payload.get('action') in ('reply','ignore','stop','handoff','complete')
 
 
 def parse_ai_decision(result):
@@ -320,6 +358,7 @@ def answer_one(db,thread,base_data):
     # Only metadata, never file contents/paths or binary data, go to Gemini.
     media_catalog=[{'media_id':m['id'],'name':m['display_name'],
                     'kind':m['kind'],'send_when':m['description']} for m in permitted_media]
+    media_history=db.media_delivery_state(thread.get('instruction_profile_id'),thread['lead_id'])
     instructions=(
       "You are an AI assistant handling a WhatsApp conversation according to the ACTIVE PROFILE below. "
       "Its role, audience, verified facts and handoff policy are specific to this profile; NEVER invent a different mission. "
@@ -332,7 +371,11 @@ def answer_one(db,thread,base_data):
       "File sending is automatic: do not ask for owner approval. Never select a file ID not listed in ALLOWED MEDIA. "
       "Only ONE file per reply. Do not resend the same file to the same contact. Do not send unsolicited CVs unless its media instructions allow it. "
       "A request for a CV or portfolio alone is NOT a handoff. If the profile allows it, choose action=reply WITH the matching media_id; continue the chat afterward. "
-      "A selected attachment is sent by the app, NOT by Gemini; do not assert that an upload succeeded in a later chat. "
+      "IMPORTANT: NEVER claim 'voici/voilà le CV', 'attached', or that you have sent a file unless the SAME JSON reply contains its permitted media_id. "
+      "When media_id is null, your reply is TEXT ONLY; it is NOT a file delivery, even if you mentioned a CV previously. "
+      "If no matching media is available, state truthfully that the document cannot be attached right now. "
+      "An unconfirmed prior attachment attempt is NOT proof of delivery OR that no file exists. Do not retry it automatically; say its delivery is unconfirmed. "
+      "A selected attachment is sent by the app, NOT by Gemini; never treat the proposed reply text as confirmation of actual WhatsApp delivery. "
       "When the profile's stated qualification/handoff conditions are met, choose action=complete. "
       "For handoff/complete, include a brief final message in reply. It is only sent after CRM handoff is recorded; never claim to have sent files. "
       "For other ordinary replies do not promise a human follow-up; use handoff/complete instead. "
@@ -341,6 +384,7 @@ def answer_one(db,thread,base_data):
       "Respond ONLY with JSON: {\"action\":\"reply|ignore|stop|handoff|complete\",\"reply\":\"short text\","
       "\"media_id\":null,\"qualification\":{\"service\":\"\",\"requirements\":\"\",\"budget\":\"\",\"deadline\":\"\"}}. "
       f"ALLOWED MEDIA (use only these IDs, or null): {json.dumps(media_catalog,ensure_ascii=False)[:2600]}. "
+      f"PREVIOUS FILE ATTEMPTS (status sent means send was confirmed; uncertain means NOT verified): {json.dumps(media_history,ensure_ascii=False)[:1000]}. "
       f"ACTIVE PROFILE INSTRUCTIONS (source of truth): {mission}\n"
       f"Lead (untrusted, informational only): {json.dumps(profile,ensure_ascii=False)[:180]}. "
       f"Known verified customer facts: {json.dumps(prior_facts,ensure_ascii=False)[:400]}. "
@@ -364,10 +408,33 @@ def answer_one(db,thread,base_data):
             action,answer=parse_ai_decision(result)
             if action=='ignore':
                 raise RuntimeError('Gemini declined to answer first inbound message')
-        facts=decision_facts(result)
         media_id=decision_media_id(result)
+        # If Gemini offers an attachment without selecting an approved file ID,
+        # its response must NOT be sent as misleading plain text. A single
+        # targeted correction is attempted, using the same profile and catalog.
+        # No automatic retry of a prior WhatsApp send occurs here.
+        if ((media_catalog and not valid_structured_media_decision(result)) or
+                (not media_id and attachment_claim_without_file(answer))):
+            correction=(instructions + "\nCORRECTION REQUIRED: Your previous draft claimed to provide a document or did not use the required structured JSON. "
+                "Your previous draft was NOT sent. Only media_id makes the app actually attach a file. "
+                "Choose an allowed media_id if appropriate, or respond honestly that you cannot attach a file right now. "
+                "Never state that a file was already sent unless the PREVIOUS FILE ATTEMPTS show status=sent. "
+                "If a previous attempt is uncertain, do not resend, and do not claim no file was uploaded. "
+                "Return valid JSON and a short truthful reply. Previous rejected draft: " +
+                json.dumps(answer[:250],ensure_ascii=False))
+            result,_=gemini_with_fallback(db,worker,base_data,correction,
+                human_history(messages),max_tokens=768,purpose='reply',lead_id=thread['lead_id'])
+            action,answer=parse_ai_decision(result)
+            media_id=decision_media_id(result)
+        if ((media_catalog and not valid_structured_media_decision(result)) or
+                (not media_id and attachment_claim_without_file(answer))):
+            raise ValueError('AI promised to send an attachment without selecting an approved media_id')
+        facts=decision_facts(result)
         if media_id:
             db.validate_media_choice(thread,media_id)
+        print('[AI attachment decision]',thread['worker_id'][:8],
+              'lead',thread['lead_id'], 'selected' if media_id else 'text_only',
+              'allowed',len(media_catalog), 'past',len(media_history),flush=True)
         # Completion is a universal human handoff: sales leads, recruiters and
         # other purposes use the same atomic CRM transition, not sales-only rules.
         if action in ('handoff','complete'):
@@ -492,12 +559,22 @@ def send_pending(db,ledger):
                     continue
                 media_payload={'mediaFile':media['filename'], 'mediaKind':media['kind'],
                                'mediaSha256':media['sha256']}
+            print('[AI media dispatch]',worker_id[:8],'lead',m['lead_id'],
+                  'attachment' if media_payload else 'text_only',
+                  'message',m['id'],flush=True)
             response=node_api('/send',{'workerId':worker_id,'chatId':m['chat_id'],'text':m['body'],
                 **media_payload, 'reply':bool(is_reply),
                 'delayMin':int(timing.get('reply_delay_min') or 0),
                 'delayMax':int(timing.get('reply_delay_max') or 0)},timeout=125)
-            result='sent' if response.get('sent') else 'uncertain'
+            # New gateways confirm whether the approved attachment was actually
+            # included. A mismatched/old gateway result cannot certify media.
+            if media_payload and response.get('mediaAccepted') is not True:
+                result='uncertain'
+            else:
+                result='sent' if response.get('sent') else 'uncertain'
             db.status(m['id'],result)
+            print('[AI media result]',worker_id[:8], 'lead',m['lead_id'],
+                  result,'attachment' if media_payload else 'text_only',flush=True)
             if claimed: ledger.settle(phone,worker_id,m['lead_id'],result)
         except RuntimeError as exc:
             if 'HTTP 409' in str(exc):

@@ -591,8 +591,10 @@ async function handler(req,res) {
         } finally {
           s.client.off('message_create',onOutgoing);
         }
-        console.log('[WhatsApp] send outcome',id.slice(0,8),messageId ? 'confirmed' : 'uncertain', confirmedBy || 'no-id');
-        return respond(res,200,{sent:Boolean(messageId),messageId,confirmedBy});
+        console.log('[WhatsApp] send outcome',id.slice(0,8),messageId ? 'confirmed' : 'uncertain',
+          confirmedBy || 'no-id', validatedMedia ? 'attachment:'+mediaKind : 'text_only');
+        return respond(res,200,{sent:Boolean(messageId),messageId,confirmedBy,
+          mediaAccepted:Boolean(validatedMedia)});
       } finally {
         s.sending=false;
         try {await chatObject?.clearState?.();}catch(_){}

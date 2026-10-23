@@ -413,6 +413,45 @@ class WorkerDB:
                   AND m.media_id=a.id AND m.status IN ('sent','uncertain','sending','queued_reply'))
                 ORDER BY a.created_at,a.id''',(profile_id,lead_id))]
 
+    def media_delivery_state(self, profile_id, lead_id, limit=6):
+        # Ground future AI replies in recorded, not assumed, media outcomes.
+        with self.connect() as c:
+            return [dict(r) for r in c.execute('''SELECT a.display_name AS name,
+                a.kind, m.status, m.created_at AS attempted_at
+                FROM ai_messages m JOIN ai_profile_media a ON m.media_id=a.id
+                WHERE a.profile_id=? AND m.lead_id=? AND m.direction='out'
+                AND m.status IN ('sent','uncertain','queued_reply','sending','failed','blocked')
+                ORDER BY m.id DESC LIMIT ?''',(profile_id,lead_id,int(limit)))]
+
+    def recent_worker_media_delivery(self, worker_id, limit=20):
+        # Do not reveal files/contacts from another worker in the controls UI.
+        with self.connect() as c:
+            return [dict(r) for r in c.execute("""SELECT m.id AS message_id, m.lead_id,
+                m.status, m.created_at, a.display_name, a.kind
+                FROM ai_messages m JOIN ai_profile_media a ON a.id=m.media_id
+                WHERE m.worker_id=? AND m.direction='out'
+                ORDER BY m.id DESC LIMIT ?""",(worker_id,int(limit)))]
+
+    def unlock_unconfirmed_media(self, worker_id, message_id):
+        """User has checked actual recipient chat and confirms no attachment.
+
+        No message is resent here. Only a later eligible inbound reply may select
+        the same approved file again. Unconfirmed attempts stay in audit history.
+        """
+        with self.connect(True) as c:
+            row=c.execute("""SELECT m.id,m.lead_id,m.media_id,m.kind,a.profile_id,
+                w.instruction_profile_id AS active_profile
+                FROM ai_messages m JOIN ai_profile_media a ON a.id=m.media_id
+                JOIN ai_workers w ON w.id=m.worker_id
+                WHERE m.id=? AND m.worker_id=? AND m.direction='out'
+                AND m.status='uncertain'""",(int(message_id),worker_id)).fetchone()
+            if (not row or row['kind']=='handoff' or row['profile_id']!=row['active_profile']):
+                raise ValueError('This attachment cannot be unlocked for retry')
+            c.execute("UPDATE ai_messages SET status='failed' WHERE id=? AND status='uncertain'",(int(message_id),))
+            self._trace_in_tx(c,row['lead_id'],worker_id,'media_retry_unlocked',
+                              'Operator verified absent WhatsApp attachment; no resend queued')
+            return True
+
     def media_record(self, media_id):
         with self.connect() as c:
             r=c.execute('SELECT * FROM ai_profile_media WHERE id=?',(media_id,)).fetchone()
@@ -1254,8 +1293,9 @@ class WorkerDB:
                 latest=c.execute("SELECT kind FROM ai_messages WHERE id=?",(message_id,)).fetchone()
                 if (latest and latest['kind'] == 'handoff') or status in ('sent','uncertain','failed','blocked'):
                     stage={'sent':'sent','uncertain':'unconfirmed','failed':'send_failed','blocked':'send_blocked'}[status]
+                    has_media=bool(c.execute('SELECT media_id FROM ai_messages WHERE id=?',(message_id,)).fetchone()[0])
                     self._trace_in_tx(c,record['lead_id'],record['worker_id'],stage,
-                                      'WhatsApp send result: '+status)
+                                      ('Media attachment' if has_media else 'Text message')+' WhatsApp send result: '+status)
             if status=='sent':
                 c.execute('UPDATE ai_threads SET last_outbound=? WHERE lead_id=(SELECT lead_id FROM ai_messages WHERE id=?)',(now(),message_id))
 

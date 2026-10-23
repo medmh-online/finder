@@ -72,7 +72,7 @@ class MediaTests(unittest.TestCase):
         def fake_node(endpoint,payload,timeout=10):
             if endpoint=='/status': return {'state':'ready'}
             sent.append((endpoint,payload))
-            return {'sent':True,'messageId':'id1'}
+            return {'sent':True,'messageId':'id1','mediaAccepted':True}
         with patch.object(ai_agent,'node_api',side_effect=fake_node):
             ai_agent.send_pending(self.db,object())
         self.assertEqual(len(sent),1)
@@ -109,6 +109,85 @@ class MediaTests(unittest.TestCase):
         # Queued replies from previous profile are superseded before sending
         with self.db.connect() as c:
             self.assertEqual(c.execute('SELECT status FROM ai_messages WHERE id=?',(identifier,)).fetchone()[0],'superseded')
+    def test_false_cv_delivery_claim_is_repaired_before_queueing(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        drafts=[
+            {'action':'reply','reply':'Voilà son CV 😊','media_id':None},
+            {'action':'reply','reply':'Voilà son CV 😊','media_id':mid},
+        ]
+        calls=[]
+        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
+            calls.append(prompt)
+            return json.dumps(drafts.pop(0)),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        self.assertEqual(len(calls),2)
+        self.assertIn('CORRECTION REQUIRED',calls[1])
+        with self.db.connect() as c:
+            sent=c.execute("SELECT media_id,status FROM ai_messages WHERE direction='out'").fetchall()
+        self.assertEqual(len(sent),1)
+        self.assertEqual((sent[0]['media_id'],sent[0]['status']),(mid,'queued_reply'))
+
+    def test_cannot_send_false_claim_without_upload(self):
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        proposals=[
+            {'action':'reply','reply':'Voilà son CV 😊','media_id':None},
+            {'action':'reply','reply':'Je ne peux pas joindre le CV actuellement.','media_id':None}
+        ]
+        with patch.object(ai_agent,'gemini_with_fallback',
+                          side_effect=lambda *args,**kwargs:(json.dumps(proposals.pop(0)),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            msg=c.execute("SELECT media_id,body FROM ai_messages WHERE direction='out'").fetchone()
+        self.assertIsNone(msg['media_id'])
+        self.assertNotIn('Voilà',msg['body'])
+
+    def test_uncertain_cv_record_is_visible_to_model_but_not_resent(self):
+        mid,_=self.upload()
+        msgid=self.db.commit_reply(self.thread,'Voilà son CV 😊',media_id=mid)
+        self.db.status(msgid,'uncertain')
+        self.assertEqual(self.db.available_media_for_lead(self.profile,1),[])
+        statuses=self.db.media_delivery_state(self.profile,1)
+        self.assertEqual(statuses[0]['status'],'uncertain')
+        hist=self.db.messages(1,limit=50)
+        self.assertNotIn('Voilà son CV',str(ai_agent.human_history(hist)))
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        prompts=[]
+        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
+            prompts.append(prompt)
+            return json.dumps({'action':'reply','reply':'Le premier envoi n’est pas confirmé, je vais vérifier.',
+                  'media_id':None}),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        self.assertIn('uncertain',prompts[0])
+        self.assertEqual(len([x for x in self.db.messages(1,limit=50) if x.get('media_id')==mid]),1)
+
+    def test_operator_unlocks_only_unconfirmed_media(self):
+        mid,_=self.upload()
+        ident=self.db.commit_reply(self.thread,'Voilà son CV',media_id=mid)
+        self.db.status(ident,'uncertain')
+        with self.assertRaises(ValueError):self.db.unlock_unconfirmed_media('wrong-worker',ident)
+        self.db.unlock_unconfirmed_media(self.worker,ident)
+        self.assertEqual(len(self.db.available_media_for_lead(self.profile,1)),1)
+        self.assertEqual(self.db.recent_worker_media_delivery(self.worker)[0]['status'],'failed')
+        with self.assertRaises(ValueError):self.db.unlock_unconfirmed_media(self.worker,ident)
+
+    def test_gateway_media_accepted_required_for_media_sent(self):
+        mid,_=self.upload()
+        ident=self.db.commit_reply(self.thread,'Voici son CV',media_id=mid)
+        def fake_node(endpoint,payload,timeout=10):
+            if endpoint=='/status':return {'state':'ready'}
+            return {'sent':True,'messageId':'123'} # old gateway, cannot prove media was attached
+        with patch.object(ai_agent,'node_api',side_effect=fake_node):
+            ai_agent.send_pending(self.db,object())
+        with self.db.connect() as c:
+            status=c.execute('SELECT status FROM ai_messages WHERE id=?',(ident,)).fetchone()[0]
+        self.assertEqual(status,'uncertain')
+
     def test_ogg_opus_direct(self):
         mid=uid()
         raw=b'OggS'+b'0'*40+b'OpusHead'+b'\x00'*80
