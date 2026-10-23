@@ -701,6 +701,19 @@ def answer_one(db,thread,base_data):
               'detail:',str(exc)[:150],flush=True)
 
 
+
+def is_definite_media_pre_send_rejection(exc):
+    """The gateway rejected media compatibility before opening any send path.
+
+    Only this exact pre-dispatch 503 can be classified FAILED rather than
+    UNCERTAIN. Timeouts, lost ACKs and other HTTP 503 responses stay uncertain
+    so they are never blindly re-sent.
+    """
+    error = str(exc)
+    return ('HTTP 503' in error and
+            'WhatsApp media compatibility unavailable:' in error)
+
+
 def send_pending(db,ledger):
     # Serial sending, global deduplication and per-worker daily new-contact budget.
     attempted_workers=set()
@@ -818,7 +831,17 @@ def send_pending(db,ledger):
             if m.get('media_id'):
                 print('[AI media gateway error]',worker_id[:8], 'lead',m['lead_id'],
                       'message',m['id'],str(exc)[:320],flush=True)
-            if 'HTTP 409' in str(exc):
+            if m.get('media_id') and is_definite_media_pre_send_rejection(exc):
+                # WhatsApp.js refused the attachment BEFORE client.sendMessage.
+                # No WhatsApp packet was sent, so this is a genuine failure, not
+                # a possible delivery. Keeping it 'uncertain' unnecessarily
+                # locks the uploaded CV forever even after compatibility is fixed.
+                db.status(m['id'],'failed')
+                print('[AI media pre-send rejection]',worker_id[:8], 'lead',m['lead_id'],
+                      'message',m['id'],'definite_failure_no_send',flush=True)
+                if claimed: ledger.release(phone,worker_id,m['lead_id'])
+                if budgeted: db.release_first_contact_attempt(m['id'])
+            elif 'HTTP 409' in str(exc):
                 db.requeue_sending(m['id'],m['status'])
                 if claimed:ledger.release(phone,worker_id,m['lead_id'])
                 if budgeted:db.release_first_contact_attempt(m['id'])
