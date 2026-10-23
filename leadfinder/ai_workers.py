@@ -220,6 +220,35 @@ class WorkerDB:
                              (revision,previous_settings_json,applied_at) VALUES(?,?,?)''',
                           (medmh_knowledge.KNOWLEDGE_REVISION,
                            json.dumps(dict(previous),ensure_ascii=False),now()))
+            # Named, reusable instruction profiles. Existing settings are
+            # preserved verbatim in the imported profile, never overwritten.
+            c.execute('''CREATE TABLE IF NOT EXISTS ai_instruction_profiles (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                instructions TEXT NOT NULL, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL)''')
+            legacy_id='legacy-medmh'
+            if not c.execute('SELECT 1 FROM ai_instruction_profiles WHERE id=?',(legacy_id,)).fetchone():
+                current=c.execute('SELECT * FROM ai_account_settings WHERE id=1').fetchone()
+                imported='\n\n'.join(x for x in (
+                    'Business: '+str(current['business_name'] or '').strip(),
+                    'Portfolio: '+str(current['portfolio'] or '').strip(),
+                    'Services: '+str(current['services'] or '').strip(),
+                    'Pricing policy: '+str(current['pricing'] or '').strip(),
+                    'Instructions: '+str(current['instructions'] or '').strip()
+                ) if x.strip())
+                c.execute('INSERT INTO ai_instruction_profiles VALUES(?,?,?,?,?)',
+                          (legacy_id,'Imported MEDMH knowledge',imported,now(),now()))
+            cols={x['name'] for x in c.execute('PRAGMA table_info(ai_workers)')}
+            if 'instruction_profile_id' not in cols:
+                c.execute("ALTER TABLE ai_workers ADD COLUMN instruction_profile_id TEXT NOT NULL DEFAULT 'legacy-medmh'")
+            c.execute("UPDATE ai_workers SET instruction_profile_id=? WHERE instruction_profile_id IS NULL",(legacy_id,))
+            cols={x['name'] for x in c.execute('PRAGMA table_info(ai_threads)')}
+            if 'instruction_profile_id' not in cols:
+                c.execute('ALTER TABLE ai_threads ADD COLUMN instruction_profile_id TEXT')
+            # Pin old conversations to the imported profile before workers can
+            # activate other profiles. Never change a conversation's purpose.
+            c.execute('UPDATE ai_threads SET instruction_profile_id=? WHERE instruction_profile_id IS NULL',
+                      (legacy_id,))
         return self
 
     @staticmethod
@@ -243,7 +272,7 @@ class WorkerDB:
             raise ValueError('Worker name is required')
         value = uid()
         with self.connect(True) as c:
-            c.execute('INSERT INTO ai_workers(id,name,created_at) VALUES(?,?,?)', (value,name,now()))
+            c.execute('INSERT INTO ai_workers(id,name,created_at,instruction_profile_id) VALUES(?,?,?,?)', (value,name,now(),'legacy-medmh'))
         return value
 
     def configure_worker(self, worker_id, **fields):
@@ -358,6 +387,93 @@ class WorkerDB:
             raise ValueError('Daily limit is invalid')
         with self.connect(True) as c:
             c.execute('UPDATE ai_account_settings SET '+', '.join(k+'=?' for k in fields)+' WHERE id=1', tuple(fields.values()))
+
+    def instruction_profiles(self):
+        with self.connect() as c:
+            return [dict(row) for row in c.execute(
+                'SELECT * FROM ai_instruction_profiles ORDER BY name COLLATE NOCASE')]
+
+    def instruction_profile(self, profile_id):
+        with self.connect() as c:
+            row=c.execute('SELECT * FROM ai_instruction_profiles WHERE id=?', (profile_id,)).fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _validate_profile(name, instructions):
+        name=str(name or '').strip()
+        instructions=str(instructions or '').strip()
+        if not 1<=len(name)<=80:
+            raise ValueError('Profile name must contain 1–80 characters')
+        if not 10<=len(instructions)<=16000:
+            raise ValueError('Instructions must contain 10–16,000 characters')
+        return name,instructions
+
+    def create_instruction_profile(self, name, instructions):
+        name,instructions=self._validate_profile(name,instructions)
+        profile_id=uid()
+        with self.connect(True) as c:
+            try:
+                c.execute('INSERT INTO ai_instruction_profiles VALUES(?,?,?,?,?)',
+                          (profile_id,name,instructions,now(),now()))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError('A profile already uses that name') from exc
+        return profile_id
+
+    def update_instruction_profile(self, profile_id, name, instructions):
+        name,instructions=self._validate_profile(name,instructions)
+        with self.connect(True) as c:
+            if not c.execute('SELECT 1 FROM ai_instruction_profiles WHERE id=?',(profile_id,)).fetchone():
+                raise ValueError('Profile not found')
+            try:
+                c.execute('UPDATE ai_instruction_profiles SET name=?,instructions=?,updated_at=? WHERE id=?',
+                          (name,instructions,now(),profile_id))
+            except sqlite3.IntegrityError as exc:
+                raise ValueError('A profile already uses that name') from exc
+
+    def delete_instruction_profile(self, profile_id):
+        with self.connect(True) as c:
+            if c.execute('SELECT 1 FROM ai_workers WHERE instruction_profile_id=?',(profile_id,)).fetchone():
+                raise ValueError('This profile is active on a worker. Switch that worker first.')
+            if c.execute('SELECT 1 FROM ai_threads WHERE instruction_profile_id=?',(profile_id,)).fetchone():
+                raise ValueError('This profile has saved conversations and cannot be deleted safely.')
+            if c.execute('SELECT COUNT(*) FROM ai_instruction_profiles').fetchone()[0]<=1:
+                raise ValueError('Keep at least one profile')
+            if c.execute('DELETE FROM ai_instruction_profiles WHERE id=?',(profile_id,)).rowcount!=1:
+                raise ValueError('Profile not found')
+
+    def activate_instruction_profile(self, worker_id, profile_id):
+        with self.connect(True) as c:
+            if not c.execute('SELECT 1 FROM ai_instruction_profiles WHERE id=?',(profile_id,)).fetchone():
+                raise ValueError('Profile not found')
+            if not c.execute('SELECT 1 FROM ai_workers WHERE id=?',(worker_id,)).fetchone():
+                raise ValueError('Worker not found')
+            c.execute('UPDATE ai_workers SET instruction_profile_id=? WHERE id=?',(profile_id,worker_id))
+            # Auto-generated first introductions from another purpose must not
+            # leak into the newly activated role. Explicit manual sends remain.
+            c.execute("UPDATE ai_messages SET status='superseded' WHERE worker_id=? AND status='queued' AND kind='intro'",
+                      (worker_id,))
+            c.execute("UPDATE ai_intro_jobs SET state='skipped' WHERE worker_id=? AND state='queued'",
+                      (worker_id,))
+            # Cancel not-yet-sent old-role AI replies. Preserve final handoffs,
+            # deliberate manual messages, and the previous conversation data.
+            c.execute('''UPDATE ai_messages SET status='superseded'
+                WHERE worker_id=? AND direction='out' AND status='queued_reply'
+                  AND kind!='handoff' AND lead_id IN (
+                    SELECT lead_id FROM ai_threads
+                    WHERE instruction_profile_id IS NOT NULL AND instruction_profile_id!=?)''',
+                      (worker_id,profile_id))
+
+    def profile_for_thread(self, thread):
+        pid=thread.get('instruction_profile_id') or self.worker(thread['worker_id']).get('instruction_profile_id')
+        return self.instruction_profile(pid) if pid else None
+
+    def paused_profile_threads(self, worker_id):
+        with self.connect() as c:
+            return c.execute('''SELECT COUNT(*) FROM ai_threads t
+                JOIN ai_assignments a ON a.lead_id=t.lead_id
+                JOIN ai_workers w ON w.id=a.worker_id
+                WHERE a.worker_id=? AND t.instruction_profile_id IS NOT NULL
+                AND t.instruction_profile_id!=w.instruction_profile_id''',(worker_id,)).fetchone()[0]
 
     def assign(self, worker_id, lead_ids):
         if not self.worker(worker_id):
@@ -712,9 +828,11 @@ class WorkerDB:
             c.execute('''INSERT INTO ai_messages(event_id,lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at)
                 VALUES(?,?,?,?,'in',?,'received',?,?)''',
                 (event_id, lead_id, worker_id, chat_id, body, sent_at or when, when))
-            c.execute('''INSERT INTO ai_threads(lead_id,last_inbound) VALUES(?,?)
-                ON CONFLICT(lead_id) DO UPDATE SET last_inbound=excluded.last_inbound,followups_sent=0''',
-                (lead_id, when))
+            active_profile=c.execute('SELECT instruction_profile_id FROM ai_workers WHERE id=?',(worker_id,)).fetchone()[0]
+            c.execute('''INSERT INTO ai_threads(lead_id,last_inbound,instruction_profile_id) VALUES(?,?,?)
+                ON CONFLICT(lead_id) DO UPDATE SET last_inbound=excluded.last_inbound,followups_sent=0,
+                    instruction_profile_id=COALESCE(ai_threads.instruction_profile_id,excluded.instruction_profile_id)''',
+                (lead_id, when, active_profile))
             c.execute('UPDATE ai_threads SET retry_after=0 WHERE lead_id=?',(lead_id,))
             self._trace_in_tx(c,lead_id,worker_id,'received','Incoming message matched to assigned lead')
             # Keep the one-off developer handoff confirmation until delivered.
@@ -804,9 +922,11 @@ class WorkerDB:
             c.execute('DELETE FROM ai_unmatched WHERE worker_id=? AND chat_id=?',
                       (worker_id, item['chat_id']))
             if last_inbound is not None:
-                c.execute('''INSERT INTO ai_threads(lead_id,last_inbound) VALUES(?,?)
-                    ON CONFLICT(lead_id) DO UPDATE SET last_inbound=excluded.last_inbound''',
-                    (lead_id,last_inbound))
+                active_profile=c.execute('SELECT instruction_profile_id FROM ai_workers WHERE id=?',(worker_id,)).fetchone()[0]
+                c.execute('''INSERT INTO ai_threads(lead_id,last_inbound,instruction_profile_id) VALUES(?,?,?)
+                    ON CONFLICT(lead_id) DO UPDATE SET last_inbound=excluded.last_inbound,
+                      instruction_profile_id=COALESCE(ai_threads.instruction_profile_id,excluded.instruction_profile_id)''',
+                    (lead_id,last_inbound,active_profile))
                 c.execute("UPDATE ai_messages SET status='superseded' WHERE lead_id=? AND direction='out' AND status='queued_reply'",(lead_id,))
             if last_outbound is not None:
                 c.execute('''INSERT INTO ai_threads(lead_id,last_outbound) VALUES(?,?)
@@ -857,6 +977,7 @@ class WorkerDB:
                 JOIN leads l ON l.id=t.lead_id AND l.archived=0
                 LEFT JOIN ai_permissions p ON p.lead_id=t.lead_id
                 WHERE t.last_inbound IS NOT NULL AND
+                  t.instruction_profile_id=w.instruction_profile_id AND
                   COALESCE(t.retry_after,0)<=?
                   AND (t.in_progress=0 OR t.lease_at<?)
                   AND t.last_inbound<=?
@@ -938,7 +1059,10 @@ class WorkerDB:
             latest=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",(lead_id,)).fetchone()[0]
             owner=c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?',(lead_id,)).fetchone()
             blocked=c.execute('SELECT 1 FROM ai_lead_control WHERE lead_id=? AND (paused=1 OR handoff=1)',(lead_id,)).fetchone()
-            if not owner or owner['worker_id']!=thread['worker_id'] or latest!=thread['latest_inbound_id'] or blocked:
+            valid_profile=c.execute('''SELECT 1 FROM ai_threads t JOIN ai_workers w ON w.id=?
+                WHERE t.lead_id=? AND t.instruction_profile_id=w.instruction_profile_id''',
+                (thread['worker_id'],lead_id)).fetchone()
+            if not owner or owner['worker_id']!=thread['worker_id'] or latest!=thread['latest_inbound_id'] or blocked or not valid_profile:
                 return None
             recent=c.execute("SELECT chat_id FROM ai_messages WHERE lead_id=? AND direction='in' ORDER BY id DESC LIMIT 1",(lead_id,)).fetchone()
             if not recent:return None
@@ -993,7 +1117,11 @@ class WorkerDB:
         with self.connect(True) as c:
             newest=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",(thread['lead_id'],)).fetchone()[0]
             current=c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?',(thread['lead_id'],)).fetchone()
+            profile_ok=c.execute('''SELECT 1 FROM ai_threads t JOIN ai_workers w ON w.id=?
+                WHERE t.lead_id=? AND t.instruction_profile_id=w.instruction_profile_id''',
+                (thread['worker_id'],thread['lead_id'])).fetchone()
             if (newest!=thread['latest_inbound_id'] or not current or current['worker_id']!=thread['worker_id']
+                or not profile_ok
                 or c.execute('SELECT 1 FROM ai_lead_control WHERE lead_id=? AND (paused=1 OR handoff=1)',(thread['lead_id'],)).fetchone()):
                 return None
             latest=c.execute('SELECT chat_id FROM ai_messages WHERE lead_id=? AND direction="in" ORDER BY id DESC LIMIT 1',(thread['lead_id'],)).fetchone()
@@ -1015,7 +1143,10 @@ class WorkerDB:
         with self.connect(True) as c:
             latest = c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'", (thread['lead_id'],)).fetchone()[0]
             assigned = c.execute('SELECT worker_id FROM ai_assignments WHERE lead_id=?', (thread['lead_id'],)).fetchone()
-            if not assigned or assigned['worker_id'] != thread['worker_id'] or latest != thread['latest_inbound_id']:
+            profile_ok=c.execute('''SELECT 1 FROM ai_threads t JOIN ai_workers w ON w.id=?
+                WHERE t.lead_id=? AND t.instruction_profile_id=w.instruction_profile_id''',
+                (thread['worker_id'],thread['lead_id'])).fetchone()
+            if not assigned or assigned['worker_id'] != thread['worker_id'] or latest != thread['latest_inbound_id'] or not profile_ok:
                 return False
             c.execute('UPDATE ai_threads SET replied_through=?,retry_after=0 WHERE lead_id=?', (latest, thread['lead_id']))
             self._trace_in_tx(c,thread['lead_id'],thread['worker_id'],'ignored',
@@ -1030,7 +1161,9 @@ class WorkerDB:
                 LEFT JOIN ai_permissions p ON p.lead_id=m.lead_id
                 LEFT JOIN ai_threads t ON t.lead_id=m.lead_id
                 JOIN ai_workers w ON w.id=a.worker_id
-                WHERE m.direction='out' AND m.status IN ('queued','queued_reply') ORDER BY m.id LIMIT 50''')]
+                WHERE m.direction='out' AND m.status IN ('queued','queued_reply')
+                  AND (m.status='queued' OR m.kind='handoff' OR t.instruction_profile_id=w.instruction_profile_id)
+                ORDER BY m.id LIMIT 50''')]
 
     def status(self,message_id,status):
         if status not in ('sent','failed','blocked','uncertain'):

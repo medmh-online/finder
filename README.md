@@ -176,3 +176,17 @@ when its project database selection is `<none>`.
 
 Offline checks (with installed dependencies):
 `.venv\Scripts\python.exe -m unittest discover -s tests -p test_medmh_knowledge.py -v`.
+
+## Reusable AI instruction profiles (PCC profile update)
+
+The previous shared business name, portfolio, services, prices and sales-instruction fields have been replaced in **AI Workers → AI profiles and quotas** by **one instructions textarea per named profile**. Create as many profiles as needed (for example, *MEDMH Sales* and *Job Hunting*), edit and save each independently. Put all verified facts, speaking style, pricing or candidate details, restrictions and handoff requirements in its single textarea. A profile must have a unique name; it can be reused on multiple workers. The separate **Daily generation limit per worker** remains a global request-count setting and is not part of a profile.
+
+On first startup after this patch, the app creates `ai_instruction_profiles` and adds a profile-selection field to each worker and a pinned profile field to each conversation. The original shared fields are **copied verbatim** into an **Imported MEDMH knowledge** profile; the old database settings and data are retained for compatibility. The installer does not embed or publish private CVs, applicant details, user keys or chats. Review/rename this imported profile before using it, particularly if you had temporarily pasted job-hunting instructions into the old shared field.
+
+To activate a profile: **AI Workers → Manage worker → Controls → Profile for this worker → Activate selected profile**. The worker will use the chosen instructions for **new conversations**. Existing conversations remain assigned to the profile with which they began and are paused when that profile is not active on the worker; selecting their profile again restores eligibility subject to normal limits, handoff state and opt-outs. The UI displays the count of older conversations on other profiles. Switching profiles does not alter any other worker's active profile. Not-yet-sent automatic introductory messages or ordinary AI replies from the previous profile are superseded; approved human handoff confirmations and manual messages are retained.
+
+If you need Job Hunting, create a new named profile and paste your own verified CV-derived facts and instructions. Do not publish sensitive personal profile text in your source repository; the profile content lives in the locally stored SQLite database. For outbound recruitment outreach, use authorized recruitment channels and respect refusals. Model prompts describe the *active profile* rather than always claiming to sell MEDMH services. A CV request can produce a CRM handoff; the assistant does not automatically transmit the CV and stops after a recorded handoff.
+
+**Backup:** Create a SQLite backup through the application's Settings page before applying the patch. The schema additions happen on startup and are not reversed automatically by a source-only PCC rollback. Verify the migration on a copy before deploying to a valuable installation.
+
+**Offline regression check:** With installed dependencies, run `.venv\Scripts\python.exe -m unittest discover -s tests -p test_ai_instruction_profiles.py -v` from the project root. Tests use a disposable SQLite database, simulate Gemini responses, and never send WhatsApp messages. Live WhatsApp/Gemini behavior still requires an authorized end-to-end test on the user's installation.

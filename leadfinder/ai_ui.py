@@ -22,21 +22,59 @@ def render_workers(access,repo):
     paths=access.paths()
     db=WorkerDB(paths.database).initialize()
     Registry(app_paths().data)  # Local worker registry, not exposed to browser.
-    st.header('AI Sales Workers')
-    st.caption('Independent WhatsApp numbers and Gemini keys; shared MedMH services, smart assignment, persistent conversations.')
+    st.header('AI Workers')
+    st.caption('Independent WhatsApp workers and Gemini models. Each worker can activate any saved instruction profile.')
     settings=db.account_settings()
-    with st.expander('Shared business knowledge and quotas',expanded=False):
-        with st.form('ai_shared'):
-            business=st.text_input('Business name',settings['business_name'])
-            portfolio=st.text_input('Portfolio URL',settings['portfolio'])
-            services=st.text_area('Services offered (shared across every worker)',settings['services'],height=145)
-            pricing=st.text_area('Approved indicative prices — shared across every worker',settings['pricing'],height=150)
-            instructions=st.text_area('Sales instructions (shared across every worker)',settings['instructions'],height=230)
-            limit=st.number_input('Daily generation limit per worker (not a Google quota)',min_value=1,max_value=50000,value=int(settings['daily_ai_limit']))
-            if st.form_submit_button('Save business knowledge'):
+    with st.expander('AI profiles and quotas',expanded=False):
+        profiles=db.instruction_profiles()
+        by_id={p['id']:p for p in profiles}
+        st.subheader('Saved instruction profiles')
+        st.caption('To change the assistant’s purpose, create a separate profile instead of replacing an existing role. Saved conversations stay tied to their original profile.')
+        chosen=st.selectbox('Choose a profile to edit',list(by_id),
+            format_func=lambda pid:by_id[pid]['name'],key='ai_profile_edit_select')
+        current=by_id[chosen]
+        with st.form('ai_profile_edit_form'):
+            profile_name=st.text_input('Profile name',value=current['name'],max_chars=80)
+            profile_instructions=st.text_area('All AI instructions',value=current['instructions'],
+                height=300,help='Put role, verified facts, speaking style, rules, and handoff instructions together here (max 16,000 characters).')
+            save_profile=st.form_submit_button('Save profile',type='primary')
+        if save_profile:
+            try:
                 access.require()
-                db.update_settings(business_name=business,portfolio=portfolio,services=services,pricing=pricing,instructions=instructions,daily_ai_limit=int(limit))
-                st.success('Updated for all workers');st.rerun()
+                db.update_instruction_profile(chosen,profile_name,profile_instructions)
+                st.success('Profile saved. New Gemini calls will use these instructions.')
+                st.rerun()
+            except ValueError as exc:st.error(str(exc))
+        with st.expander('Create another profile'):
+            with st.form('ai_new_profile'):
+                new_name=st.text_input('New profile name',placeholder='Job Hunting')
+                new_instructions=st.text_area('All instructions for this profile',height=230,
+                    placeholder='Describe the assistant, verified facts, tasks, conversation style and when to hand off...')
+                if st.form_submit_button('Create profile'):
+                    try:
+                        access.require()
+                        profile_id=db.create_instruction_profile(new_name,new_instructions)
+                        st.success('Profile created. Select it on a worker to activate it.')
+                        st.rerun()
+                    except ValueError as exc:st.error(str(exc))
+        with st.expander('Delete selected profile'):
+            st.caption('Profiles used by workers or saved conversations cannot be deleted.')
+            if st.button('Delete this unused profile',key='ai_delete_instruction_profile'):
+                try:
+                    access.require()
+                    db.delete_instruction_profile(chosen)
+                    st.session_state.pop('ai_profile_edit_select',None)
+                    st.rerun()
+                except ValueError as exc:st.error(str(exc))
+        st.divider()
+        with st.form('ai_generation_quota'):
+            limit=st.number_input('Daily generation limit per worker (rolling 24h)',
+                min_value=1,max_value=50000,value=int(settings['daily_ai_limit']))
+            if st.form_submit_button('Save quota'):
+                access.require()
+                db.update_settings(daily_ai_limit=int(limit))
+                st.success('Worker generation quota saved.')
+                st.rerun()
     with st.expander('Create another WhatsApp worker',expanded=not bool(db.workers())):
         with st.form('ai_worker_create'):
             name=st.text_input('Worker name',placeholder='Sales Worker 1')
@@ -54,6 +92,27 @@ def render_workers(access,repo):
     active,connection,keys = st.tabs(['Controls','WhatsApp browser','Gemini keys + models'])
     with active:
         st.subheader(worker['name'])
+        profiles=db.instruction_profiles()
+        names={profile['id']:profile['name'] for profile in profiles}
+        active_id=worker.get('instruction_profile_id')
+        st.markdown('**Active AI instruction profile**')
+        if active_id not in names:
+            st.error('The active profile is missing. Choose another profile to resume AI replies.')
+        proposed=st.selectbox('Profile for this worker',list(names),
+            index=list(names).index(active_id) if active_id in names else 0,
+            format_func=lambda pid:names[pid],key='worker_instruction_profile_select_'+picked)
+        if st.button('Activate selected profile',key='activate_profile_'+picked,
+                     disabled=proposed==active_id):
+            try:
+                access.require()
+                db.activate_instruction_profile(picked,proposed)
+                st.success('Profile activated. New conversations use it; older ones retain their original profile.')
+                st.rerun()
+            except ValueError as exc:st.error(str(exc))
+        blocked_count=db.paused_profile_threads(picked)
+        if blocked_count:
+            st.info(f'{blocked_count} older conversation(s) belong to another profile and are paused while this profile is active. Switching back restores their eligibility (subject to normal reply limits).')
+        st.caption('Profiles are reusable across workers. Switching does not overwrite conversation history or change other workers.')
         st.caption(f"New contacts initiated today: {db.daily_new_contact_used(picked)} / {worker['daily_new_contacts']} (UTC)")
         generation=db.generation_quota(picked)
         st.metric('AI generation attempts · rolling 24h', f"{generation['used']:,} / {generation['limit']:,}")
