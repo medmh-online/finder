@@ -86,23 +86,19 @@ class MediaTests(unittest.TestCase):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**k:True
-        drafts=[json.dumps({'action':'handoff','reply':'Voici le CV. Mohammed prendra le relais.',
-                'media_id':mid,'media_requested':True}),
-                json.dumps({'requested_matching_file':True,'media_id':mid})]
         prompts=[]
-        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
-            prompts.append(prompt)
-            return drafts.pop(0),{}
-        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+        def route(*args,**kwargs):
+            prompts.append(args[3])
+            return json.dumps({'file_requested':True,'human_required':False,'media_id':mid}),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=route):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
-        self.assertEqual(len(prompts),2)
-        self.assertIn('independent attachment-routing verifier',prompts[1])
+        self.assertEqual(len(prompts),1)
+        self.assertIn('attachment request classifier',prompts[0])
         with self.db.connect() as c:
             r=c.execute("SELECT kind,media_id,body FROM ai_messages WHERE direction='out'").fetchone()
             handoff=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
         self.assertEqual(r['media_id'],mid)
         self.assertNotEqual(r['kind'],'handoff')
-        self.assertNotIn('prendra le relais',r['body'])
         self.assertFalse(handoff and handoff['handoff'])
         self.assertEqual(self.db.available_media_for_lead(self.profile,1),[])
 
@@ -110,13 +106,15 @@ class MediaTests(unittest.TestCase):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**k:True
-        drafts=[json.dumps({'action':'reply','reply':'Désolé, je ne peux pas joindre le CV actuellement.',
-                             'media_id':None}),
-                json.dumps({'requested_matching_file':True,'media_id':mid})]
-        with patch.object(ai_agent,'gemini_with_fallback',side_effect=lambda *a,**k:(drafts.pop(0),{})):
+        # Generic text generation is never called for an authorized request.
+        calls=[]
+        def gen(*a,**k):
+            calls.append(a[3]);return json.dumps({'file_requested':True,'human_required':False,'media_id':mid}),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=gen):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
         with self.db.connect() as c:
             out=c.execute("SELECT body,media_id,status FROM ai_messages WHERE direction='out'").fetchone()
+        self.assertEqual(len(calls),1)
         self.assertEqual(out['media_id'],mid)
         self.assertEqual(out['status'],'queued_reply')
         self.assertNotIn('peux pas',out['body'])
@@ -125,8 +123,8 @@ class MediaTests(unittest.TestCase):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**k:True
-        drafts=[json.dumps({'action':'handoff','reply':'Mohammed vous appellera personnellement.',
-                             'media_id':None}),
+        drafts=[json.dumps({'file_requested':False,'human_required':True,'media_id':None}),
+                json.dumps({'action':'handoff','reply':'Mohammed vous appellera personnellement.','media_id':None}),
                 json.dumps({'requested_matching_file':False,'media_id':None})]
         with patch.object(ai_agent,'gemini_with_fallback',side_effect=lambda *a,**k:(drafts.pop(0),{})):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
@@ -165,18 +163,13 @@ class MediaTests(unittest.TestCase):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**kw:True
-        drafts=[
-            {'action':'reply','reply':'Voilà son CV 😊','media_id':None},
-            {'action':'reply','reply':'Voilà son CV 😊','media_id':mid},
-        ]
         calls=[]
-        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
-            calls.append(prompt)
-            return json.dumps(drafts.pop(0)),{}
-        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+        def gen(*args,**kwargs):
+            calls.append(args[3])
+            return json.dumps({'file_requested':True,'human_required':False,'media_id':mid}),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=gen):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
-        self.assertEqual(len(calls),2)
-        self.assertIn('CORRECTION REQUIRED',calls[1])
+        self.assertEqual(len(calls),1)
         with self.db.connect() as c:
             sent=c.execute("SELECT media_id,status FROM ai_messages WHERE direction='out'").fetchall()
         self.assertEqual(len(sent),1)
@@ -209,13 +202,17 @@ class MediaTests(unittest.TestCase):
         self.db.working_models=lambda wid:['model1']
         self.db.token_budget_available=lambda *a,**kw:True
         prompts=[]
-        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
-            prompts.append(prompt)
-            return json.dumps({'action':'reply','reply':'Le premier envoi n’est pas confirmé, je vais vérifier.',
-                  'media_id':None}),{}
-        with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
+        def gen(*args,**kwargs):
+            prompts.append(args[3])
+            return json.dumps({'file_requested':True,'human_required':False,'media_id':mid}),{}
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=gen):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
-        self.assertIn('uncertain',prompts[0])
+        self.assertIn('"available": false',prompts[0])
+        self.assertEqual(len(prompts),1)
+        with self.db.connect() as c:
+            out=c.execute('SELECT media_id,body,status FROM ai_messages WHERE direction="out" ORDER BY id DESC LIMIT 1').fetchone()
+        self.assertIsNone(out['media_id'])
+        self.assertIn('pas encore confirmé',out['body'])
         self.assertEqual(len([x for x in self.db.messages(1,limit=50) if x.get('media_id')==mid]),1)
 
     def test_operator_unlocks_only_unconfirmed_media(self):
@@ -256,19 +253,16 @@ class MediaTests(unittest.TestCase):
         remove_file(filename)
         self.assertFalse((media_root()/filename).exists())
     def test_requested_cv_remains_active_and_queues_media(self):
-        mid, _ = self.upload()
-        self.db.working_models = lambda wid: ['model1']
-        self.db.token_budget_available = lambda *a, **k: True
-        prompts = []
-        def fake_gen(db, worker, base, prompt, dialogue, **kwargs):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**k:True
+        prompts=[]
+        def fake_gen(db,worker,base,prompt,dialogue,**kwargs):
             prompts.append(prompt)
-            return json.dumps({'action':'reply','reply':'Voici son CV. Avez-vous des questions ?',
-                'media_id':mid,'qualification':{'service':'Recruitment'}}), {}
+            return json.dumps({'file_requested':True,'human_required':False,'media_id':mid}),{}
         with patch.object(ai_agent,'gemini_with_fallback',side_effect=fake_gen):
             ai_agent.answer_one(self.db,self.thread,self.tmp.name)
-        self.assertTrue(prompts)
-        self.assertIn('A request for a CV or portfolio alone is NOT a handoff',prompts[0])
-        self.assertNotIn('person requests a human, CV, interview',prompts[0])
+        self.assertIn('A CV or portfolio request alone never requires human handoff',prompts[0])
         with self.db.connect() as conn:
             msg=conn.execute("SELECT kind,media_id,status FROM ai_messages WHERE direction='out'").fetchone()
             ctrl=conn.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
@@ -276,5 +270,49 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(msg['status'],'queued_reply')
         self.assertNotEqual(msg['kind'],'handoff')
         self.assertFalse(ctrl and ctrl['handoff'])
+
+    def test_router_does_not_send_for_greeting(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        answers=[{'file_requested':False,'human_required':False,'media_id':None},
+                 {'action':'reply','reply':'Bonjour ! Comment puis-je vous aider ?','media_id':None}]
+        with patch.object(ai_agent,'gemini_with_fallback',side_effect=lambda *a,**k:(json.dumps(answers.pop(0)),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            out=c.execute("SELECT body,media_id FROM ai_messages WHERE direction='out'").fetchone()
+        self.assertIsNone(out['media_id'])
+        self.assertIn('Bonjour',out['body'])
+
+    def test_router_rejects_unapproved_id_no_handoff(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        with patch.object(ai_agent,'gemini_with_fallback',return_value=(json.dumps(
+            {'file_requested':True,'human_required':False,'media_id':'a'*32}),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            self.assertEqual(c.execute("SELECT count(*) FROM ai_messages WHERE direction='out'").fetchone()[0],0)
+            self.assertEqual(c.execute('SELECT count(*) FROM ai_lead_control WHERE handoff=1').fetchone()[0],0)
+
+    def test_router_selects_before_main_model_and_dispatches(self):
+        mid,_=self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        with patch.object(ai_agent,'gemini_with_fallback',return_value=(json.dumps(
+            {'file_requested':True,'human_required':False,'media_id':mid}),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        deliveries=[]
+        def fake_node(endpoint,payload,timeout=10):
+            if endpoint=='/status':return {'state':'ready'}
+            deliveries.append(payload);return {'sent':True,'messageId':'wamid.fake','mediaAccepted':True}
+        with patch.object(ai_agent,'node_api',side_effect=fake_node):
+            ai_agent.send_pending(self.db,object())
+        self.assertEqual(len(deliveries),1)
+        self.assertEqual(deliveries[0]['mediaKind'],'document')
+        self.assertEqual(deliveries[0]['mediaFile'],self.db.media_record(mid)['filename'])
+        with self.db.connect() as c:
+            msg=c.execute("SELECT status FROM ai_messages WHERE direction='out'").fetchone()
+        self.assertEqual(msg['status'],'sent')
 
 if __name__=='__main__':unittest.main()

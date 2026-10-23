@@ -218,6 +218,29 @@ def render_workers(access,repo):
                                 'the file did NOT arrive, then unlock that attempt under Media send status below.')
                 except (ValueError,OSError) as exc:
                     st.error(str(exc))
+        with st.expander('Check WhatsApp media gateway · no file sent'):
+            st.caption('Tests the connected WhatsApp worker and its ability to read the uploaded file. '
+                       'No WhatsApp message is created and no CV is sent.')
+            active_media=db.media_for_profile(worker.get('instruction_profile_id'))
+            if active_media:
+                options={m['id']:m for m in active_media}
+                selected_media=st.selectbox('File to check',list(options),
+                    format_func=lambda item:options[item]['display_name'],key='gateway_media_test_'+picked)
+                if st.button('Check media readiness in WhatsApp.js',key='media_preflight_'+picked):
+                    item=options[selected_media]
+                    result=bridge('/media-check',{'workerId':picked,
+                        'mediaFile':item['filename'],'mediaKind':item['kind'],
+                        'mediaSha256':item['sha256']})
+                    if result.get('mediaReady'):
+                        st.success('Gateway can access and prepare the file ('+
+                            str(result.get('bytes'))+' bytes). Live delivery still needs a recipient test.')
+                        st.caption('Compatibility: '+str(result.get('mediaCompatibility')))
+                    else:
+                        st.error('Gateway preflight failed: '+str(result.get('error') or 'Unknown error'))
+                        if result.get('mediaCompatibility'):
+                            st.caption('Compatibility: '+str(result['mediaCompatibility']))
+            else:
+                st.warning('Upload and enable a file on this worker’s active profile first.')
         with st.expander('Media send status · verify attachments in WhatsApp'):
             st.caption('Confirmed means the gateway returned a WhatsApp message ID, not proof the recipient read it. '
                        'Unconfirmed means delivery is unknown. MEDMH will not automatically retry an unconfirmed file.')

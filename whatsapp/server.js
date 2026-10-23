@@ -450,6 +450,28 @@ async function backupAndResetPairing(id) {
   fs.renameSync(src,dst);
   return {reset:true,backup:dst};
 }
+function approvedMediaFile(mediaFile,mediaKind,mediaSha) {
+  if (!['patched_in_memory','already_fixed'].includes(mediaCompatibility.status))
+    throw httpError(503,'WhatsApp media compatibility unavailable: '+mediaCompatibility.error);
+  if(!/^[0-9a-f]{32}\.(pdf|png|jpg|webp|ogg)$/.test(mediaFile) ||
+     !['document','image','voice'].includes(mediaKind) ||
+     !/^[0-9a-f]{64}$/.test(mediaSha))
+    throw httpError(400,'invalid approved media reference');
+  const extension=path.extname(mediaFile);
+  if ((mediaKind==='document'&&extension!=='.pdf') ||
+      (mediaKind==='image'&&!['.png','.jpg','.webp'].includes(extension)) ||
+      (mediaKind==='voice'&&extension!=='.ogg'))
+    throw httpError(400,'media type mismatch');
+  const filename=path.join(mediaRoot,mediaFile);
+  const stat=fs.lstatSync(filename,{throwIfNoEntry:true});
+  if(!stat || !stat.isFile() || stat.isSymbolicLink() || stat.size>12*1024*1024 || stat.size<1)
+    throw httpError(400,'unavailable or unsafe media');
+  const contents=fs.readFileSync(filename);
+  if(crypto.createHash('sha256').update(contents).digest('hex')!==mediaSha)
+    throw httpError(400,'media integrity check failed');
+  return {filename,size:stat.size,media:MessageMedia.fromFilePath(filename)};
+}
+
 async function handler(req,res) {
   try {
     if(!eq(req.headers['x-bridge-secret'],token))return respond(res,403,{error:'forbidden'});
@@ -497,6 +519,23 @@ async function handler(req,res) {
       return respond(res,200,{registered:!!lookup?._serialized,
         chatId:lookup?._serialized||null});
     }
+    if(req.url==='/media-check') {
+      const s=clients.get(id);
+      if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')
+        return respond(res,409,{error:'Worker AI not connected'});
+      const mediaFile=String(data.mediaFile||'');
+      const mediaKind=String(data.mediaKind||'');
+      const mediaSha=String(data.mediaSha256||'');
+      try {
+        const checked=approvedMediaFile(mediaFile,mediaKind,mediaSha);
+        return respond(res,200,{mediaReady:true,kind:mediaKind,bytes:checked.size,
+          mediaCompatibility:mediaCompatibility.status});
+      } catch(err) {
+        console.warn('[WhatsApp media preflight]',id.slice(0,8),keep(err,220));
+        return respond(res,err.statusCode||500,{mediaReady:false,error:keep(err,220),
+          mediaCompatibility:mediaCompatibility.status});
+      }
+    }
     if(req.url==='/send') {
       const s=clients.get(id);
       if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')return respond(res,409,{error:'Worker AI not connected'});
@@ -508,25 +547,9 @@ async function handler(req,res) {
         return respond(res,400,{error:'invalid chat or message'});
       let validatedMedia=null;
       if(mediaFile){
-        if (!['patched_in_memory','already_fixed'].includes(mediaCompatibility.status))
-          return respond(res,503,{error:'WhatsApp media compatibility unavailable: '+mediaCompatibility.error});
-        if(!/^[0-9a-f]{32}\.(pdf|png|jpg|webp|ogg)$/.test(mediaFile) ||
-           !['document','image','voice'].includes(mediaKind) ||
-           !/^[0-9a-f]{64}$/.test(mediaSha))
-          return respond(res,400,{error:'invalid approved media reference'});
-        const extension=path.extname(mediaFile);
-        if ((mediaKind==='document'&&extension!=='.pdf') ||
-            (mediaKind==='image'&&!['.png','.jpg','.webp'].includes(extension)) ||
-            (mediaKind==='voice'&&extension!=='.ogg'))
-          return respond(res,400,{error:'media type mismatch'});
-        const filename=path.join(mediaRoot,mediaFile);
-        const stat=fs.lstatSync(filename,{throwIfNoEntry:true});
-        if(!stat || !stat.isFile() || stat.isSymbolicLink() || stat.size>12*1024*1024 || stat.size<1)
-          return respond(res,400,{error:'unavailable or unsafe media'});
-        const contents=fs.readFileSync(filename);
-        if(crypto.createHash('sha256').update(contents).digest('hex')!==mediaSha)
-          return respond(res,400,{error:'media integrity check failed'});
-        validatedMedia=MessageMedia.fromFilePath(filename);
+        const approved=approvedMediaFile(mediaFile,mediaKind,mediaSha);
+        validatedMedia=approved.media;
+        console.log('[WhatsApp media verified]',id.slice(0,8),mediaKind,'bytes',approved.size);
       }
       // Typing state is optional; failure must never prevent a legitimate reply.
       // The call is serialized per worker so two replies never type/send together.
@@ -557,12 +580,25 @@ async function handler(req,res) {
           return typeof id === 'string' && id.length > 0 ? id : null;
         };
         const onOutgoing = m => {
-          // For media, the caption can be omitted (voice) or WhatsApp may
-          // encode it differently. Only trust an explicit returned message ID.
-          if (!validatedMedia && m?.fromMe === true && m.to === chat && m.body === message) {
-            const confirmedId = messageIdOf(m);
-            if (confirmedId) acknowledgeEcho(confirmedId);
+          // Listen for an ACTUAL outgoing WhatsApp message with a MsgKey.
+          // A media send may return no Message ID from sendMessage even when
+          // message_create receives the queued PDF/image/voice. Do not count
+          // unrelated text messages as evidence that an attachment was sent.
+          if (m?.fromMe !== true || m.to !== chat) return;
+          const confirmedId = messageIdOf(m);
+          if (!confirmedId) return;
+          if (!validatedMedia) {
+            if (m.body === message && !m.hasMedia) acknowledgeEcho(confirmedId);
+            return;
           }
+          const kindMatches = (mediaKind === 'document' && m.type === 'document') ||
+            (mediaKind === 'image' && m.type === 'image') ||
+            (mediaKind === 'voice' && (m.type === 'ptt' || m.type === 'audio'));
+          // For documents/images WhatsApp normally preserves the caption;
+          // voice notes have no caption. Don't accept a matching text echo.
+          const captionMatches = mediaKind === 'voice' || !message.trim() ||
+            String(m.body || '') === message.slice(0,1000);
+          if (kindMatches && captionMatches) acknowledgeEcho(confirmedId);
         };
         s.client.on('message_create',onOutgoing);
         let messageId = null;

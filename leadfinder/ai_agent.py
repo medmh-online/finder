@@ -127,6 +127,61 @@ def independent_media_review(result):
     return value
 
 
+def parse_media_router(result, allowed_ids):
+    """One narrowly scoped Gemini decision BEFORE drafting a chat reply.
+
+    The model judges the recipient's actual request; it cannot choose filesystem
+    paths, override profile permissions, or force an automatic resend.
+    """
+    clean=str(result or '').strip()
+    if clean.startswith('```'):
+        clean=clean.split('\n',1)[-1].rsplit('```',1)[0].strip()
+    decision=json.loads(clean)
+    if not isinstance(decision,dict) or type(decision.get('file_requested')) is not bool or type(decision.get('human_required')) is not bool:
+        raise ValueError('Invalid attachment router JSON')
+    selection=decision.get('media_id')
+    if selection in (None,''):selection=None
+    if selection is not None and (not isinstance(selection,str) or selection not in allowed_ids):
+        raise ValueError('Attachment router chose an unknown media ID')
+    if not decision['file_requested'] and selection:
+        raise ValueError('Attachment router selected a file without a request')
+    return decision['file_requested'],decision['human_required'],selection
+
+
+def route_incoming_attachment(db,worker,base_data,thread,mission,messages,all_media,available_ids):
+    """Resolve explicit requests first, avoiding generic-model false handoffs.
+
+    Gemini sees only safe file metadata plus availability, never binary data.
+    The allowed IDs are only from the ACTIVE profile. An unavailable document
+    can be identified but never sent or retried without operator verification.
+    """
+    current=next((m.get('body','') for m in reversed(messages)
+                  if m.get('direction')=='in'),'')
+    catalog=[{'media_id':m['id'],'name':m['display_name'],'kind':m['kind'],
+              'send_when':m['description'],'available':m['id'] in available_ids,
+              'enabled':bool(m['enabled'])}
+              for m in all_media]
+    instruction=(
+        'You are an attachment request classifier for a WhatsApp AI. '
+        'Interpret the latest customer message semantically in its language (including Darija). '
+        'Decide whether the customer actually requests one of the listed files, respecting each send_when rule. '
+        'A CV or portfolio request alone never requires human handoff. '
+        'Set human_required=true ONLY if the customer additionally asks for a human, interview, '
+        'meeting, salary negotiation, binding decision, or something requiring the profile owner. '
+        'If a matching file is unavailable, still select its file ID; Python will NOT send it. '
+        'Do not infer file requests from greetings or unrelated context. '
+        'Return ONLY strict JSON: {"file_requested":false,"human_required":false,"media_id":null}. '
+        'When file_requested=true return the matching ID, or null if no saved file matches. '
+        'FILES: '+json.dumps(catalog,ensure_ascii=False)[:5000]+'\n'
+        'ACTIVE PROFILE: '+mission[:2300]+'\n'
+        'LATEST MESSAGE: '+json.dumps(current[:900],ensure_ascii=False)
+    )
+    raw,_=gemini_with_fallback(db,worker,base_data,instruction,
+        [{'role':'user','parts':[{'text':'Classify the attachment request; do not write a customer-facing reply.'}]}],
+        max_tokens=180,purpose='reply',lead_id=thread['lead_id'])
+    return parse_media_router(raw,{m['id'] for m in all_media})
+
+
 def decision_media_id(result):
     """Only opaque IDs are accepted, never Gemini-supplied file paths."""
     clean=str(result or '').strip()
@@ -439,6 +494,49 @@ def answer_one(db,thread,base_data):
     )
 
     if not messages:return
+    # Attachment routing runs BEFORE free-form chat generation. Previously the
+    # generic reply could apologize or hand off without ever selecting media.
+    # An eligible document is queued atomically with its caption (never as a
+    # separate text message) and the AI remains active for the next question.
+    if db.media_for_profile(thread.get('instruction_profile_id'),only_enabled=False):
+        try:
+            full_catalog=db.media_for_profile(thread.get('instruction_profile_id'),only_enabled=False)
+            requested,human_required,matched=route_incoming_attachment(
+                db,worker,base_data,thread,mission,messages,full_catalog,
+                {m['id'] for m in permitted_media})
+            print('[AI media router]',thread['worker_id'][:8], 'lead',thread['lead_id'],
+                  'requested',requested,'human',human_required,
+                  'selected',bool(matched),'eligible',len(permitted_media),flush=True)
+            if requested and matched and not human_required:
+                if matched in {m['id'] for m in permitted_media}:
+                    db.validate_media_choice(thread,matched)
+                    record=next(m for m in permitted_media if m['id']==matched)
+                    caption=('Voici le document demandé 😊' if record['kind']=='document'
+                             else 'Voici le fichier demandé 😊')
+                    db.commit_reply(thread,caption,media_id=matched)
+                    return
+                # A previous attempt may be uncertain. Never pretend delivery
+                # or re-send without the operator checking the real chat.
+                past=[m for m in media_history if m['name']==next(
+                    (a['display_name'] for a in full_catalog if a['id']==matched),'')]
+                uncertain=any(m['status'] in ('uncertain','sending','queued_reply') for m in past)
+                previously_sent=any(m['status']=='sent' for m in past)
+                explanation=('L’envoi du document n’est pas encore confirmé. Je préfère éviter un double envoi.'
+                             if uncertain else
+                             'Le document a déjà été envoyé dans cette conversation.' if previously_sent else
+                             'Le document demandé est momentanément indisponible.')
+                db.commit_reply(thread,explanation)
+                return
+        except ValueError as route_exc:
+            # Do not turn a broken model JSON into a false confirmation or a
+            # permanent handoff. Preserve the inbound for a controlled retry.
+            db.retry_reply(thread,'Media decision invalid: '+str(route_exc)[:100],delay=60)
+            print('[AI media router error]',thread['worker_id'][:8],str(route_exc)[:160],flush=True)
+            return
+        except Exception as route_exc:
+            db.retry_reply(thread,'Media classification failed',delay=60)
+            print('[AI media router error]',thread['worker_id'][:8],repr(route_exc)[:160],flush=True)
+            return
     try:
         result,usage=gemini_with_fallback(db,worker,base_data,
             instructions,human_history(messages),max_tokens=768,purpose='reply',lead_id=thread['lead_id'])
@@ -667,11 +765,17 @@ def send_pending(db,ledger):
                 result='uncertain'
             else:
                 result='sent' if response.get('sent') else 'uncertain'
+            if media_payload and result!='sent':
+                print('[AI media delivery unconfirmed]',worker_id[:8], 'lead',m['lead_id'],
+                      'message',m['id'],'gateway',str(response)[:400],flush=True)
             db.status(m['id'],result)
             print('[AI media result]',worker_id[:8], 'lead',m['lead_id'],
                   result,'attachment' if media_payload else 'text_only',flush=True)
             if claimed: ledger.settle(phone,worker_id,m['lead_id'],result)
         except RuntimeError as exc:
+            if m.get('media_id'):
+                print('[AI media gateway error]',worker_id[:8], 'lead',m['lead_id'],
+                      'message',m['id'],str(exc)[:320],flush=True)
             if 'HTTP 409' in str(exc):
                 db.requeue_sending(m['id'],m['status'])
                 if claimed:ledger.release(phone,worker_id,m['lead_id'])
@@ -683,7 +787,10 @@ def send_pending(db,ledger):
             else:
                 db.status(m['id'],'uncertain')
                 if claimed:ledger.settle(phone,worker_id,m['lead_id'],'uncertain')
-        except Exception:
+        except Exception as exc:
+            if m.get('media_id'):
+                print('[AI media gateway error]',worker_id[:8], 'lead',m['lead_id'],
+                      'message',m['id'],repr(exc)[:320],flush=True)
             db.status(m['id'],'uncertain')
             if claimed:ledger.settle(phone,worker_id,m['lead_id'],'uncertain')
 
