@@ -71,6 +71,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError('invalid event id')
             body=str(data.get('text',''))[:3000]
             sender_phone=str(data.get('senderPhone') or '')[:32]
+            # Outbound events are accepted only after a real WhatsApp server ACK.
+            # Old persisted 'message_create' events have no ack and are ignored.
+            if data.get('direction')=='out' and not (
+                    type(data.get('ack')) is int and 1 <= data['ack'] <= 4):
+                self.answer(200,{'stored':False,'reason':'outbound_not_server_acknowledged'})
+                return
             db,_=registry.resolve(worker)
             lead_id=(db.outgoing_sync(worker,event,chat,body,sender_phone=sender_phone) if data.get('direction')=='out'
                      else db.inbound(worker,event,chat,body,sender_phone=sender_phone))

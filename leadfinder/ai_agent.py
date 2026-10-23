@@ -765,14 +765,20 @@ def send_pending(db,ledger):
                 'delayMax':int(timing.get('reply_delay_max') or 0)},timeout=125)
             # New gateways confirm whether the approved attachment was actually
             # included. A mismatched/old gateway result cannot certify media.
+            ack_confirmed=(response.get('sent') is True and
+                response.get('confirmedBy')=='server_ack' and
+                type(response.get('ack')) is int and response['ack'] >= 1)
             if media_payload and response.get('mediaAccepted') is not True:
-                result='uncertain'
-            else:
-                result='sent' if response.get('sent') else 'uncertain'
+                ack_confirmed=False
+            result='sent' if ack_confirmed else 'uncertain'
+            if not ack_confirmed:
+                print('[AI send not confirmed]',worker_id[:8], 'lead',m['lead_id'],
+                      'message',m['id'],'reason',str(response.get('reason') or
+                      'missing_server_ack')[:110],flush=True)
             if media_payload and result!='sent':
                 print('[AI media delivery unconfirmed]',worker_id[:8], 'lead',m['lead_id'],
                       'message',m['id'],'gateway',str(response)[:400],flush=True)
-            db.status(m['id'],result)
+            db.status(m['id'],result,event_id=response.get('messageId'))
             print('[AI media result]',worker_id[:8], 'lead',m['lead_id'],
                   result,'attachment' if media_payload else 'text_only',flush=True)
             if claimed: ledger.settle(phone,worker_id,m['lead_id'],result)

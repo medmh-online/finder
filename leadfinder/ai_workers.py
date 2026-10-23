@@ -1103,8 +1103,13 @@ class WorkerDB:
         placeholders = ','.join('?' for _ in ids)
         with self.connect() as c:
             rows = c.execute(f"""SELECT m.lead_id, COUNT(*) AS count,
-                   SUBSTR((SELECT recent.body FROM ai_messages recent
-                      WHERE recent.lead_id=m.lead_id ORDER BY recent.id DESC LIMIT 1),1,110) AS preview
+                   SUBSTR((SELECT CASE
+                     WHEN recent.direction='in' OR recent.status='sent' THEN recent.body
+                     WHEN recent.status IN ('queued','queued_reply','sending') THEN '[QUEUED - not sent] '||recent.body
+                     WHEN recent.status='uncertain' THEN '[UNCONFIRMED - not verified] '||recent.body
+                     ELSE '[NOT SENT: '||recent.status||'] '||recent.body END
+                     FROM ai_messages recent WHERE recent.lead_id=m.lead_id
+                     ORDER BY recent.id DESC LIMIT 1),1,110) AS preview
                 FROM ai_messages m WHERE m.lead_id IN ({placeholders}) GROUP BY m.lead_id""", ids)
             return {int(r['lead_id']): dict(r) for r in rows}
 
@@ -1326,20 +1331,32 @@ class WorkerDB:
                   AND (m.status='queued' OR m.kind='handoff' OR t.instruction_profile_id=w.instruction_profile_id)
                 ORDER BY m.id LIMIT 50''')]
 
-    def status(self,message_id,status):
+    def status(self,message_id,status,event_id=None):
         if status not in ('sent','failed','blocked','uncertain'):
             raise ValueError('Invalid message status')
         with self.connect(True) as c:
-            c.execute('UPDATE ai_messages SET status=? WHERE id=? AND direction="out" AND status IN ("queued","queued_reply","sending")',(status,message_id))
-            record=c.execute("SELECT lead_id,worker_id FROM ai_messages WHERE id=? AND direction='out'",(message_id,)).fetchone()
+            # Store a *real* WhatsApp message ID even when the server ACK is
+            # still missing, allowing a later ACK to reconcile this exact
+            # attempt. Never guess an ID or overwrite an existing event ID.
+            real_id=(str(event_id) if isinstance(event_id,str) and
+                     1 <= len(event_id) <= 150 and not event_id.startswith('fallback-')
+                     else None)
+            if real_id and c.execute('SELECT 1 FROM ai_messages WHERE event_id=? AND id<>?',
+                                      (real_id,message_id)).fetchone():
+                real_id=None
+            c.execute('''UPDATE ai_messages SET status=?,event_id=COALESCE(event_id,?)
+                WHERE id=? AND direction='out' AND status IN ('queued','queued_reply','sending')''',
+                (status,real_id,message_id))
+            record=c.execute("SELECT lead_id,worker_id,status FROM ai_messages WHERE id=? AND direction='out'",(message_id,)).fetchone()
             if record and record['lead_id'] is not None:
                 latest=c.execute("SELECT kind FROM ai_messages WHERE id=?",(message_id,)).fetchone()
-                if (latest and latest['kind'] == 'handoff') or status in ('sent','uncertain','failed','blocked'):
-                    stage={'sent':'sent','uncertain':'unconfirmed','failed':'send_failed','blocked':'send_blocked'}[status]
+                actual_status=record['status']
+                if (latest and latest['kind'] == 'handoff') or actual_status in ('sent','uncertain','failed','blocked'):
+                    stage={'sent':'sent','uncertain':'unconfirmed','failed':'send_failed','blocked':'send_blocked'}[actual_status]
                     has_media=bool(c.execute('SELECT media_id FROM ai_messages WHERE id=?',(message_id,)).fetchone()[0])
                     self._trace_in_tx(c,record['lead_id'],record['worker_id'],stage,
-                                      ('Media attachment' if has_media else 'Text message')+' WhatsApp send result: '+status)
-            if status=='sent':
+                                      ('Media attachment' if has_media else 'Text message')+' WhatsApp send result: '+actual_status)
+            if record and record['status']=='sent':
                 c.execute('UPDATE ai_threads SET last_outbound=? WHERE lead_id=(SELECT lead_id FROM ai_messages WHERE id=?)',(now(),message_id))
 
     def chat_for_lead(self,lead_id):
@@ -1424,7 +1441,14 @@ class WorkerDB:
     def outgoing_sync(self,worker_id,event_id,chat_id,body,sent_at=None,sender_phone=''):
         """Capture manual WhatsApp sends without duplicating app-sent messages."""
         with self.connect(True) as c:
-            if c.execute('SELECT 1 FROM ai_messages WHERE event_id=?',(event_id,)).fetchone():
+            existing=c.execute('SELECT id,lead_id,status,worker_id,direction FROM ai_messages WHERE event_id=?',
+                                (event_id,)).fetchone()
+            if existing:
+                if existing['worker_id']==worker_id and existing['direction']=='out' and existing['status']=='uncertain':
+                    c.execute('UPDATE ai_messages SET status="sent" WHERE id=?',(existing['id'],))
+                    if existing['lead_id'] is not None:
+                        c.execute('UPDATE ai_threads SET last_outbound=? WHERE lead_id=?',(now(),existing['lead_id']))
+                    return existing['lead_id']
                 return None
             if c.execute('SELECT 1 FROM ai_unmatched WHERE event_id=?',(event_id,)).fetchone():
                 return None
@@ -1434,11 +1458,13 @@ class WorkerDB:
                 return None
             lead_id=lead['id']
             matched=c.execute("""SELECT id FROM ai_messages WHERE lead_id=? AND worker_id=? AND
-                      direction='out' AND chat_id=? AND body=? AND (status='queued' OR status='queued_reply' OR
-                      (status='sent' AND created_at>?)) ORDER BY id DESC LIMIT 1""",
+                      direction='out' AND chat_id=? AND body=? AND created_at>? AND
+                      status IN ('queued','queued_reply','sending','uncertain','sent')
+                      ORDER BY id DESC LIMIT 1""",
                       (lead_id,worker_id,chat_id,body,now()-120)).fetchone()
             if matched:
-                c.execute('UPDATE ai_messages SET event_id=?,status="sent" WHERE id=? AND event_id IS NULL',(event_id,matched['id']))
+                c.execute('UPDATE ai_messages SET status="sent",event_id=COALESCE(event_id,?) WHERE id=?',
+                          (event_id,matched['id']))
                 c.execute('''INSERT INTO ai_threads(lead_id,last_outbound) VALUES(?,?)
                     ON CONFLICT(lead_id) DO UPDATE SET last_outbound=excluded.last_outbound''',(lead_id,now()))
                 return lead_id

@@ -72,7 +72,7 @@ class MediaTests(unittest.TestCase):
         def fake_node(endpoint,payload,timeout=10):
             if endpoint=='/status': return {'state':'ready'}
             sent.append((endpoint,payload))
-            return {'sent':True,'messageId':'id1','mediaAccepted':True}
+            return {'sent':True,'messageId':'id1','mediaAccepted':True,'confirmedBy':'server_ack','ack':1}
         with patch.object(ai_agent,'node_api',side_effect=fake_node):
             ai_agent.send_pending(self.db,object())
         self.assertEqual(len(sent),1)
@@ -336,7 +336,7 @@ class MediaTests(unittest.TestCase):
         deliveries=[]
         def fake_node(endpoint,payload,timeout=10):
             if endpoint=='/status':return {'state':'ready'}
-            deliveries.append(payload);return {'sent':True,'messageId':'wamid.fake','mediaAccepted':True}
+            deliveries.append(payload);return {'sent':True,'messageId':'wamid.fake','mediaAccepted':True,'confirmedBy':'server_ack','ack':1}
         with patch.object(ai_agent,'node_api',side_effect=fake_node):
             ai_agent.send_pending(self.db,object())
         self.assertEqual(len(deliveries),1)

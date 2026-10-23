@@ -14,7 +14,8 @@ const { spawn } = require('node:child_process');
 const { loadWhatsAppWithMediaFix } = require('./compat/media_id_fix');
 const { sdk: whatsAppSDK, mediaCompatibility } = loadWhatsAppWithMediaFix();
 const { Client, NoAuth, MessageMedia } = whatsAppSDK;
-const { messageIdOf, eventIdOf, outgoingMediaEchoMatches } = require('./compat/message_events');
+const { messageIdOf, eventIdOf } = require('./compat/message_events');
+const { sendWithServerAck } = require('./compat/server_ack');
 console.log('[WhatsApp media compatibility]',mediaCompatibility.status,mediaCompatibility.error || '');
 
 const host = '127.0.0.1';
@@ -289,12 +290,21 @@ function wireMessages(s,client) {
     });
   };
   client.on('message',m=>ingestInbound(m,'message'));
+  // message_create is LOCAL to WhatsApp Web. It does not prove the message
+  // reached the WhatsApp server; never promote an outgoing message to 'sent'
+  // from this event. Keep it only as an inbound-event fallback.
   client.on('message_create',m=>{
-    if(!valid())return;
-    if(!m?.fromMe){ ingestInbound(m,'message_create_fallback'); return; }
+    if(valid() && !m?.fromMe) ingestInbound(m,'message_create_fallback');
+  });
+  // Only a server ACK (1+) is authoritative for syncing manual outgoing chats.
+  // Automated sends have their own ACK listener within /send and stay serialized.
+  client.on('message_ack',(m,ack)=>{
+    if(!valid() || s.sending || !m?.fromMe || !Number.isInteger(ack) || ack<1)return;
     if(!m.to || !/@(?:c\.us|lid)$/.test(m.to))return;
-    const ev={workerId:s.workerId,eventId:eventIdOf(m,m.to,'out'),
-      chatId:m.to,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp,direction:'out'};
+    const realId=messageIdOf(m);
+    if(!realId || realId.length>150)return;
+    const ev={workerId:s.workerId,eventId:realId,
+      chatId:m.to,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp,direction:'out',ack};
     // A manual outgoing conversation can later identify the same LID chat.
     void (async()=>{
       if(m.to.endsWith('@lid')){
@@ -594,59 +604,38 @@ async function handler(req,res) {
           if(waitSeconds>0)await new Promise(resolve=>setTimeout(resolve,waitSeconds*1000));
           if(!s.active || s.status!=='ready')throw httpError(409,'Worker disconnected before send');
         }
-        // Some WhatsApp Web releases show the outgoing message even when
-        // sendMessage() returns a Message without its serialized ID.
-        // Listen BEFORE sending for a real outgoing message_create event.
-        // If neither source provides an ID, report uncertainty; NEVER retry.
-        let acknowledgeEcho;
-        const echo = new Promise(resolve => { acknowledgeEcho = resolve; });
-        const onOutgoing = m => {
-          // Listen for an ACTUAL outgoing WhatsApp message with a MsgKey.
-          // A media send may return no Message ID from sendMessage even when
-          // message_create receives the queued PDF/image/voice. Do not count
-          // unrelated text messages as evidence that an attachment was sent.
-          if (!outgoingMediaEchoMatches(m,chat,mediaKind,message,Boolean(validatedMedia))) return;
-          const confirmedId=messageIdOf(m);
-          if (confirmedId) acknowledgeEcho(confirmedId);
-        };
-        s.client.on('message_create',onOutgoing);
-        let messageId = null;
-        let confirmedBy = null;
-        try {
-          const options={sendSeen:false};
-          let outbound=message;
-          if(validatedMedia){
-            outbound=validatedMedia;
-            if(mediaKind==='voice')options.sendAudioAsVoice=true;
-            else {
-              options.caption=message.slice(0,1000);
-              if(mediaKind==='document')options.sendMediaAsDocument=true;
-            }
+        // A Message ID and message_create are LOCAL WhatsApp Web events.
+        // Wait for ACK>=1 from WhatsApp's server before claiming a send succeeded.
+        // A missing ACK is UNCERTAIN, never automatically retried.
+        const options={sendSeen:false};
+        let outbound=message;
+        if(validatedMedia){
+          outbound=validatedMedia;
+          if(mediaKind==='voice')options.sendAudioAsVoice=true;
+          else {
+            options.caption=message.slice(0,1000);
+            if(mediaKind==='document')options.sendMediaAsDocument=true;
           }
-          let sent;
-          try {
-            sent = await s.client.sendMessage(chat,outbound,options);
-          } catch (error) {
-            console.error('[WhatsApp attachment send failed]',id.slice(0,8),
-              validatedMedia ? mediaKind : 'text',keep(error,280));
-            throw error; // Never fake a successful send or silently auto-retry.
-          }
-          messageId = messageIdOf(sent);
-          if (messageId) confirmedBy = 'sendMessage';
-          if (!messageId) {
-            messageId = await Promise.race([
-              echo,
-              new Promise(resolve => setTimeout(() => resolve(null), 4500))
-            ]);
-            if (messageId) confirmedBy = 'message_create';
-          }
-        } finally {
-          s.client.off('message_create',onOutgoing);
         }
-        console.log('[WhatsApp] send outcome',id.slice(0,8),messageId ? 'confirmed' : 'uncertain',
-          confirmedBy || 'no-id', validatedMedia ? 'attachment:'+mediaKind : 'text_only');
-        return respond(res,200,{sent:Boolean(messageId),messageId,confirmedBy,
-          mediaAccepted:Boolean(validatedMedia)});
+        let verified;
+        try {
+          verified=await sendWithServerAck(s.client,{
+            chatId:chat,text:message,kind:mediaKind,hasMedia:Boolean(validatedMedia),
+            timeoutMs:40000,
+            send:()=>s.client.sendMessage(chat,outbound,options)
+          });
+        } catch(error) {
+          console.error('[WhatsApp attachment send failed]',id.slice(0,8),
+            validatedMedia ? mediaKind : 'text',keep(error,280));
+          throw error;
+        }
+        console.log('[WhatsApp] send outcome',id.slice(0,8),
+          verified.sent ? 'server_ack_confirmed' : 'uncertain',
+          verified.confirmedBy || verified.reason || 'no-ack',
+          validatedMedia ? 'attachment:'+mediaKind : 'text_only');
+        return respond(res,200,{sent:verified.sent,messageId:verified.messageId,
+          confirmedBy:verified.confirmedBy,ack:verified.ack||0,
+          reason:verified.reason||null,mediaAccepted:Boolean(validatedMedia)});
       } finally {
         s.sending=false;
         try {await chatObject?.clearState?.();}catch(_){}
