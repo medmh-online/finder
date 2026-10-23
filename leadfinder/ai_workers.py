@@ -249,6 +249,17 @@ class WorkerDB:
             # activate other profiles. Never change a conversation's purpose.
             c.execute('UPDATE ai_threads SET instruction_profile_id=? WHERE instruction_profile_id IS NULL',
                       (legacy_id,))
+            # Media is profile-scoped, additive, and never stored in source/Git.
+            c.execute('''CREATE TABLE IF NOT EXISTS ai_profile_media (
+                id TEXT PRIMARY KEY, profile_id TEXT NOT NULL REFERENCES ai_instruction_profiles(id),
+                display_name TEXT NOT NULL, description TEXT NOT NULL,
+                filename TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,
+                file_size INTEGER NOT NULL, sha256 TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1, created_at REAL NOT NULL)''')
+            c.execute('CREATE INDEX IF NOT EXISTS ai_profile_media_profile ON ai_profile_media(profile_id)')
+            msg_cols={x['name'] for x in c.execute('PRAGMA table_info(ai_messages)')}
+            if 'media_id' not in msg_cols:
+                c.execute('ALTER TABLE ai_messages ADD COLUMN media_id TEXT')
         return self
 
     @staticmethod
@@ -388,6 +399,72 @@ class WorkerDB:
         with self.connect(True) as c:
             c.execute('UPDATE ai_account_settings SET '+', '.join(k+'=?' for k in fields)+' WHERE id=1', tuple(fields.values()))
 
+    def media_for_profile(self, profile_id, only_enabled=True):
+        with self.connect() as c:
+            return [dict(x) for x in c.execute(
+                'SELECT * FROM ai_profile_media WHERE profile_id=? '+
+                ('AND enabled=1 ' if only_enabled else '')+'ORDER BY created_at,id', (profile_id,))]
+
+    def available_media_for_lead(self, profile_id, lead_id):
+        """Hide files already sent/queued/uncertain to this contact from Gemini."""
+        with self.connect() as c:
+            return [dict(r) for r in c.execute('''SELECT a.* FROM ai_profile_media a WHERE a.profile_id=? AND a.enabled=1
+                AND NOT EXISTS (SELECT 1 FROM ai_messages m WHERE m.lead_id=?
+                  AND m.media_id=a.id AND m.status IN ('sent','uncertain','sending','queued_reply'))
+                ORDER BY a.created_at,a.id''',(profile_id,lead_id))]
+
+    def media_record(self, media_id):
+        with self.connect() as c:
+            r=c.execute('SELECT * FROM ai_profile_media WHERE id=?',(media_id,)).fetchone()
+            return dict(r) if r else None
+
+    def add_profile_media(self, profile_id, display_name, description, filename, kind, file_size, sha256, media_id):
+        label=str(display_name or '').strip()[:120]
+        description=str(description or '').strip()[:500]
+        if not label or not description:
+            raise ValueError('Give the attachment a name and clear sending instructions')
+        if kind not in ('document','image','voice') or not re.fullmatch('[0-9a-f]{32}\\.(?:pdf|png|jpg|webp|ogg)',filename):
+            raise ValueError('Invalid attachment file')
+        with self.connect(True) as c:
+            if not c.execute('SELECT 1 FROM ai_instruction_profiles WHERE id=?',(profile_id,)).fetchone():
+                raise ValueError('Profile does not exist')
+            c.execute('''INSERT INTO ai_profile_media(id,profile_id,display_name,description,filename,kind,file_size,sha256,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?)''',
+                (media_id,profile_id,label,description,filename,kind,int(file_size),sha256,now()))
+
+    def set_media_enabled(self, media_id, enabled):
+        with self.connect(True) as c:
+            if c.execute('UPDATE ai_profile_media SET enabled=? WHERE id=?',(int(bool(enabled)),media_id)).rowcount!=1:
+                raise ValueError('Attachment not found')
+
+    def delete_profile_media(self, media_id):
+        # Already-sent metadata remains in ai_messages (media_id), but the file
+        # will be removed. Pending messages are cancelled first.
+        with self.connect(True) as c:
+            r=c.execute('SELECT filename FROM ai_profile_media WHERE id=?',(media_id,)).fetchone()
+            if not r: raise ValueError('Attachment not found')
+            c.execute("UPDATE ai_messages SET status='blocked' WHERE media_id=? AND status IN ('queued','queued_reply')",(media_id,))
+            c.execute('DELETE FROM ai_profile_media WHERE id=?',(media_id,))
+            return r['filename']
+
+    def validate_media_choice(self, thread, media_id):
+        media=self.media_record(media_id)
+        if (not media or not media['enabled'] or
+            media['profile_id'] != thread.get('instruction_profile_id')):
+            raise ValueError('AI selected a missing or unauthorized attachment')
+        from .ai_media import media_root
+        import hashlib
+        path=media_root()/media['filename']
+        if path.is_symlink() or not path.is_file() or path.stat().st_size!=media['file_size']:
+            raise ValueError('Attachment file is missing or changed')
+        if hashlib.sha256(path.read_bytes()).hexdigest()!=media['sha256']:
+            raise ValueError('Attachment file integrity mismatch')
+        with self.connect() as c:
+            repeat=c.execute("SELECT 1 FROM ai_messages WHERE lead_id=? AND media_id=? AND direction='out' AND status IN ('sent','uncertain','sending','queued_reply') LIMIT 1",
+                             (thread['lead_id'],media_id)).fetchone()
+        if repeat: raise ValueError('Attachment already sent or pending for this lead')
+        return media
+
     def instruction_profiles(self):
         with self.connect() as c:
             return [dict(row) for row in c.execute(
@@ -436,6 +513,8 @@ class WorkerDB:
                 raise ValueError('This profile is active on a worker. Switch that worker first.')
             if c.execute('SELECT 1 FROM ai_threads WHERE instruction_profile_id=?',(profile_id,)).fetchone():
                 raise ValueError('This profile has saved conversations and cannot be deleted safely.')
+            if c.execute('SELECT 1 FROM ai_profile_media WHERE profile_id=?',(profile_id,)).fetchone():
+                raise ValueError('Delete this profile’s media first')
             if c.execute('SELECT COUNT(*) FROM ai_instruction_profiles').fetchone()[0]<=1:
                 raise ValueError('Keep at least one profile')
             if c.execute('DELETE FROM ai_instruction_profiles WHERE id=?',(profile_id,)).rowcount!=1:
@@ -1048,7 +1127,7 @@ class WorkerDB:
             qualification_questions=qualification_questions+? WHERE lead_id=?''',
             (json.dumps(known,ensure_ascii=False),int(bool(question)),lead_id))
 
-    def complete_qualification(self, thread, final_message, facts=None, reason='qualified'):
+    def complete_qualification(self, thread, final_message, facts=None, reason='qualified', media_id=None):
         """Atomically queue ONE final answer, flag developer follow-up and stop the AI.
 
         Completing a lead must not suppress its own final confirmation. The
@@ -1070,9 +1149,9 @@ class WorkerDB:
             # Prevent all pending introductions, follow-ups and stale replies.
             c.execute('''UPDATE ai_messages SET status='blocked' WHERE lead_id=? AND direction='out'
                   AND status IN ('queued','queued_reply')''',(lead_id,))
-            c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at,kind)
-                VALUES(?,?,?,'out',?,'queued_reply',?,?,'handoff')''',
-                (lead_id,thread['worker_id'],recent['chat_id'],final_message,now(),now()))
+            c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at,kind,media_id)
+                VALUES(?,?,?,'out',?,'queued_reply',?,?,'handoff',?)''',
+                (lead_id,thread['worker_id'],recent['chat_id'],final_message,now(),now(),media_id))
             outgoing=c.execute('SELECT last_insert_rowid()').fetchone()[0]
             c.execute('''UPDATE ai_threads SET replied_through=?,followups_sent=1,retry_after=0 WHERE lead_id=?''',(latest,lead_id))
             self._trace_in_tx(c,lead_id,thread['worker_id'],'queued','Final developer handoff message queued')
@@ -1112,7 +1191,7 @@ class WorkerDB:
                 THEN 'Interested' ELSE crm_status END, contacted=1,next_followup=NULL WHERE id=?''',(lead_id,))
             return True
 
-    def commit_reply(self,thread,body,facts=None):
+    def commit_reply(self,thread,body,facts=None,media_id=None):
         """Only queue a response if no new inbound arrived mid-generation."""
         with self.connect(True) as c:
             newest=c.execute("SELECT MAX(id) FROM ai_messages WHERE lead_id=? AND direction='in'",(thread['lead_id'],)).fetchone()[0]
@@ -1127,8 +1206,8 @@ class WorkerDB:
             latest=c.execute('SELECT chat_id FROM ai_messages WHERE lead_id=? AND direction="in" ORDER BY id DESC LIMIT 1',(thread['lead_id'],)).fetchone()
             if not latest:
                 return None
-            c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at)
-                 VALUES(?,?,?,'out',?,'queued_reply',?,?)''',(thread['lead_id'],thread['worker_id'],latest['chat_id'],body,now(),now()))
+            c.execute('''INSERT INTO ai_messages(lead_id,worker_id,chat_id,direction,body,status,sent_at,created_at,media_id)
+                 VALUES(?,?,?,'out',?,'queued_reply',?,?,?)''',(thread['lead_id'],thread['worker_id'],latest['chat_id'],body,now(),now(),media_id))
             identifier=c.execute('SELECT last_insert_rowid()').fetchone()[0]
             c.execute('UPDATE ai_threads SET replied_through=?,retry_after=0 WHERE lead_id=?',(newest,thread['lead_id']))
             self._trace_in_tx(c,thread['lead_id'],thread['worker_id'],'queued','Reply generated; waiting for WhatsApp send')

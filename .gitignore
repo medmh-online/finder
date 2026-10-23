@@ -1,3 +1,4 @@
+
 # Do not commit keys, phone sessions, conversation data or installed packages.
 ai_bridge_token.secret
 ai_encryption.key
@@ -20,14 +21,6 @@ logs/
 backups/
 whatsapp/compat/backups/
 
-# Generated installer output and queue runtime heartbeat.
-INSTALL_LOG.txt
-queue_dispatcher_status.json
 
-# Local Python virtual environments and Streamlit private settings.
-.venv/
-venv/
-.streamlit/secrets.toml
-
-# Backups of connected WhatsApp authentication sessions (never commit).
-whatsapp/session_backups/
+# Local profile media (CV, personal audio, and portfolio assets)
+ai_media/

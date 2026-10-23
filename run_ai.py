@@ -1,3 +1,4 @@
+
 """Launch AI gateway, WhatsApp Node process, and the ORIGINAL Streamlit launcher."""
 import os
 from pathlib import Path
@@ -20,6 +21,7 @@ if __name__=='__main__':
     Registry(root_data)
     env=os.environ.copy()
     env['MEDMH_BRIDGE_TOKEN_FILE']=str(root_data/'ai_bridge_token.secret')
+    env['MEDMH_MEDIA_DIR']=str(root_data/'ai_media')
     env['MEDMH_QUEUE_EXTERNAL']='1'  # prevent two dispatchers for the same batch
     programs=[]
     try:
@@ -36,3 +38,4 @@ if __name__=='__main__':
                 proc.terminate()
                 try:proc.wait(timeout=6)
                 except subprocess.TimeoutExpired:proc.kill()
+

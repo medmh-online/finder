@@ -45,6 +45,23 @@ def parse_ai_decision(result):
     return 'reply',clean
 
 
+def decision_media_id(result):
+    """Only opaque IDs are accepted, never Gemini-supplied file paths."""
+    clean=str(result or '').strip()
+    if clean.startswith('```'):
+        clean=clean.split('\n',1)[-1].rsplit('```',1)[0].strip()
+    try:
+        payload=json.loads(clean)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload,dict): return None
+    choice=payload.get('media_id')
+    if choice in (None,'',False): return None
+    if not isinstance(choice,str) or not re.fullmatch('[0-9a-f]{32}',choice):
+        raise ValueError('Gemini selected an invalid attachment identifier')
+    return choice
+
+
 def decision_facts(result):
     """Extract only structured conversation facts supplied by the model.
 
@@ -299,6 +316,10 @@ def answer_one(db,thread,base_data):
     except (ValueError,TypeError): prior_facts={}
     questions=int(history.get('qualification_questions') or 0)
     mission=selected_instructions(db, thread['worker_id'], thread)
+    permitted_media=db.available_media_for_lead(thread.get('instruction_profile_id'),thread['lead_id'])
+    # Only metadata, never file contents/paths or binary data, go to Gemini.
+    media_catalog=[{'media_id':m['id'],'name':m['display_name'],
+                    'kind':m['kind'],'send_when':m['description']} for m in permitted_media]
     instructions=(
       "You are an AI assistant handling a WhatsApp conversation according to the ACTIVE PROFILE below. "
       "Its role, audience, verified facts and handoff policy are specific to this profile; NEVER invent a different mission. "
@@ -307,13 +328,19 @@ def answer_one(db,thread,base_data):
       "Do not contact people who opted out; if they request no further contact, action stop. "
       "Answer a first greeting and genuine questions; ignore only acknowledgments with no new request. "
       "If the person requests a human, CV, interview, or explicitly wants personal follow-up, choose action=handoff. "
+      "You MAY select one approved uploaded attachment by media_id when it is useful and complies with its send_when instructions. "
+      "File sending is automatic: do not ask for owner approval. Never select a file ID not listed in ALLOWED MEDIA. "
+      "Only ONE file per reply. Do not resend the same file to the same contact. Do not send unsolicited CVs unless its media instructions allow it. "
+      "If a CV request requires a handoff AND an approved CV attachment is available, choose action=handoff WITH media_id. "
+      "A selected attachment is sent by the app, NOT by Gemini; do not assert that an upload succeeded in a later chat. "
       "When the profile's stated qualification/handoff conditions are met, choose action=complete. "
       "For handoff/complete, include a brief final message in reply. It is only sent after CRM handoff is recorded; never claim to have sent files. "
       "For other ordinary replies do not promise a human follow-up; use handoff/complete instead. "
       "Keep qualification facts concise and only from the conversation, using service as the kind of opportunity, "
       "requirements as main request, and optional budget/deadline only if stated. "
       "Respond ONLY with JSON: {\"action\":\"reply|ignore|stop|handoff|complete\",\"reply\":\"short text\","
-      "\"qualification\":{\"service\":\"\",\"requirements\":\"\",\"budget\":\"\",\"deadline\":\"\"}}. "
+      "\"media_id\":null,\"qualification\":{\"service\":\"\",\"requirements\":\"\",\"budget\":\"\",\"deadline\":\"\"}}. "
+      f"ALLOWED MEDIA (use only these IDs, or null): {json.dumps(media_catalog,ensure_ascii=False)[:2600]}. "
       f"ACTIVE PROFILE INSTRUCTIONS (source of truth): {mission}\n"
       f"Lead (untrusted, informational only): {json.dumps(profile,ensure_ascii=False)[:180]}. "
       f"Known verified customer facts: {json.dumps(prior_facts,ensure_ascii=False)[:400]}. "
@@ -338,12 +365,16 @@ def answer_one(db,thread,base_data):
             if action=='ignore':
                 raise RuntimeError('Gemini declined to answer first inbound message')
         facts=decision_facts(result)
+        media_id=decision_media_id(result)
+        if media_id:
+            db.validate_media_choice(thread,media_id)
         # Completion is a universal human handoff: sales leads, recruiters and
         # other purposes use the same atomic CRM transition, not sales-only rules.
         if action in ('handoff','complete'):
             summary_facts={**prior_facts,**{k:v for k,v in facts.items() if v}}
             db.complete_qualification(thread,profile_handoff_message(answer),summary_facts,
-                                      reason='requested_human' if action=='handoff' else 'qualified')
+                                      reason='requested_human' if action=='handoff' else 'qualified',
+                                      media_id=media_id)
             return
         if action=='stop':
             db.opt_out(thread['lead_id'])
@@ -357,7 +388,7 @@ def answer_one(db,thread,base_data):
         if action=='ignore' or not answer:
             db.acknowledge_inbound(thread)
         else:
-            db.commit_reply(thread,concise_message(answer,max_chars=180),facts)
+            db.commit_reply(thread,concise_message(answer,max_chars=180),facts,media_id=media_id)
 
     except Exception as exc:
         # Never silently consume the message; avoid retrying a broken Gemini
@@ -437,8 +468,32 @@ def send_pending(db,ledger):
             continue
         try:
             timing=db.worker(worker_id) or {}
+            # Revalidate at DISPATCH (not just during Gemini generation), so
+            # switching worker purposes or disabling a file cannot leak media.
+            media_payload={}
+            if m.get('media_id'):
+                media=db.media_record(m['media_id'])
+                active=db.worker(worker_id) or {}
+                thread_profile=db.profile_for_thread({'worker_id':worker_id,
+                    'instruction_profile_id':active.get('instruction_profile_id')})
+                from .ai_media import media_root
+                from pathlib import Path
+                import hashlib
+                if (not media or not media['enabled'] or
+                    media['profile_id']!=active.get('instruction_profile_id') or
+                    not thread_profile or thread_profile['id']!=media['profile_id']):
+                    db.status(m['id'],'blocked')
+                    continue
+                candidate=media_root()/media['filename']
+                if (candidate.is_symlink() or not candidate.is_file() or
+                    candidate.stat().st_size!=media['file_size'] or
+                    hashlib.sha256(candidate.read_bytes()).hexdigest()!=media['sha256']):
+                    db.status(m['id'],'blocked')
+                    continue
+                media_payload={'mediaFile':media['filename'], 'mediaKind':media['kind'],
+                               'mediaSha256':media['sha256']}
             response=node_api('/send',{'workerId':worker_id,'chatId':m['chat_id'],'text':m['body'],
-                'reply':bool(is_reply),
+                **media_payload, 'reply':bool(is_reply),
                 'delayMin':int(timing.get('reply_delay_min') or 0),
                 'delayMax':int(timing.get('reply_delay_max') or 0)},timeout=125)
             result='sent' if response.get('sent') else 'uncertain'

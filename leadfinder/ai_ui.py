@@ -57,6 +57,54 @@ def render_workers(access,repo):
                         st.success('Profile created. Select it on a worker to activate it.')
                         st.rerun()
                     except ValueError as exc:st.error(str(exc))
+        st.divider()
+        st.subheader('Uploaded attachments for selected profile')
+        st.caption('Files stay on this PC. Gemini sees only the name and sending rule, not the file itself. '
+                   'Approved files may be sent automatically when Gemini decides it is appropriate.')
+        rows=db.media_for_profile(chosen,only_enabled=False)
+        for media in rows:
+            d1,d2=st.columns([5,2])
+            d1.write(('✅ ' if media['enabled'] else '⏸️ ')+media['display_name']+
+                     ' · '+media['kind']+' · '+str(round(media['file_size']/1024))+' KB')
+            d1.caption(media['description'])
+            if d2.button('Disable' if media['enabled'] else 'Enable', key='media_toggle_'+media['id']):
+                access.require()
+                db.set_media_enabled(media['id'],not media['enabled'])
+                st.rerun()
+            with st.expander('Delete '+media['display_name']):
+                if st.button('Delete uploaded file',key='delete_media_'+media['id']):
+                    access.require()
+                    from .ai_media import remove_file
+                    filename=db.delete_profile_media(media['id'])
+                    remove_file(filename)
+                    st.rerun()
+        with st.form('ai_media_upload_'+chosen,clear_on_submit=True):
+            new_media=st.file_uploader('Upload PDF, image or voice recording (up to 12 MB)',
+                type=['pdf','png','jpg','jpeg','webp','ogg','opus','mp3','wav','m4a'],
+                key='ai_media_upload_file_'+chosen)
+            label=st.text_input('Attachment name',placeholder='Mohammed CV')
+            send_when=st.text_area('When should the AI send this file?',height=90,
+                placeholder='Send only if a recruiter asks for Mohammed’s CV; then hand off.')
+            submit=st.form_submit_button('Upload to this profile')
+            if submit:
+                if not new_media:
+                    st.error('Choose a file first.')
+                else:
+                    from .ai_workers import uid
+                    from .ai_media import store_upload,remove_file
+                    item_id=uid()
+                    filename=None
+                    try:
+                        access.require()
+                        filename,kind,size,hashval=store_upload(item_id,new_media.name,new_media.getvalue())
+                        db.add_profile_media(chosen,label,send_when,filename,kind,size,hashval,item_id)
+                        st.success('Media uploaded to this profile.')
+                        st.rerun()
+                    except (ValueError,OSError) as exc:
+                        if filename: remove_file(filename)
+                        st.error(str(exc))
+        st.caption('Ogg/Opus recordings can be uploaded directly. MP3/M4A/WAV conversion requires FFmpeg on Windows PATH. PDFs and images need no conversion.')
+        st.divider()
         with st.expander('Delete selected profile'):
             st.caption('Profiles used by workers or saved conversations cannot be deleted.')
             if st.button('Delete this unused profile',key='ai_delete_instruction_profile'):

@@ -1,5 +1,6 @@
+
 'use strict';
-/** MedMH canonical WhatsApp gateway; reuses the existing WhatsApp tab.
+/** MedMH v2.2.5 isolated CDP workers; reuse existing WhatsApp tab.
  * Uses Chrome --remote-debugging-port for optional AI attachment to the already-open browser.
  * Each user-controlled worker owns a unique browser profile; never uses normal Chrome's profile.
  * Experimental: AI injection can still fail due to WhatsApp Web compatibility.
@@ -10,7 +11,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const net = require('node:net');
 const { spawn } = require('node:child_process');
-const { Client, NoAuth } = require('whatsapp-web.js');
+const { Client, NoAuth, MessageMedia } = require('whatsapp-web.js');
 
 const host = '127.0.0.1';
 const port = 8767;
@@ -20,6 +21,7 @@ if (!token) throw Error('Missing AI bridge secret. Run INSTALL.bat first.');
 const sessionRoot = path.resolve(__dirname, 'sessions');
 const backupRoot = path.resolve(__dirname, 'session_backups');
 const eventRoot = path.resolve(__dirname, 'event_queue');
+const mediaRoot = path.resolve(process.env.MEDMH_MEDIA_DIR || path.resolve(__dirname,'..','ai_media'));
 for (const dir of [sessionRoot,eventRoot]) fs.mkdirSync(dir,{recursive:true,mode:0o700});
 if (process.platform !== 'win32') for (const dir of [sessionRoot,eventRoot]) fs.chmodSync(dir,0o700);
 const idRE = /^[0-9a-f]{32}$/;
@@ -169,83 +171,6 @@ async function eventPost(event) {
   });
   if (!r.ok) throw Error('AI gateway HTTP '+r.status);
 }
-// Recover WhatsApp's opaque LID identities from *verified* registrations
-// of phone numbers explicitly assigned to this worker. This is bounded and
-// independent of queue sending: it never messages an assigned lead.
-const resolvingLids = new Set();
-async function bridgePost(path,payload,timeout=12000) {
-  const r=await fetch('http://127.0.0.1:8766'+path,{
-    method:'POST',headers:{'Content-Type':'application/json','x-bridge-secret':token},
-    body:JSON.stringify(payload),signal:AbortSignal.timeout(timeout)
-  });
-  if(!r.ok)throw Error('AI bridge HTTP '+r.status);
-  return await r.json();
-}
-async function verifyLidAgainstAssignedPhones(s, lid) {
-  if(!isCurrent(s)||s.status!=='ready'||!/^\d{9,20}@lid$/.test(lid))return;
-  const key=s.workerId+':'+lid;
-  if(resolvingLids.has(key))return;
-  // Cache unresolved lookup attempts briefly, not forever: WhatsApp mappings
-  // may become available when the user opens a conversation later.
-  s.identityRetryAt ||= new Map();
-  if((s.identityRetryAt.get(lid)||0)>Date.now())return;
-  s.identityRetryAt.set(lid,Date.now()+180000);
-  resolvingLids.add(key);
-  try {
-    const d=await bridgePost('/match-candidates',{workerId:s.workerId,chatId:lid});
-    if(d.reason){console.log('[WhatsApp identity]',s.workerId.slice(0,8),d.reason);return;}
-    const candidates=Array.isArray(d.phones)?d.phones:[];
-    // Never guess from the digits in LID, contact name, or message text.
-    for(const phone of candidates) {
-      if(!isCurrent(s)||s.status!=='ready')break;
-      if(!/^\+[1-9]\d{8,14}$/.test(phone))continue;
-      try {
-        const lookup=await Promise.race([
-          s.client.getNumberId(phone.slice(1)+'@c.us'),
-          new Promise((_,reject)=>setTimeout(()=>reject(Error('Registration timeout')),7000))
-        ]);
-        const id=String(lookup?._serialized||'');
-        let verified = id===lid;
-        // Some WhatsApp releases return @c.us for getNumberId. Ask WhatsApp
-        // for its related LID, not the app for a guessed conversion.
-        if(!verified && /^\d{9,15}@c\.us$/.test(id) &&
-           typeof s.client.getContactLidAndPhone==='function') {
-          const pairs=await Promise.race([
-            s.client.getContactLidAndPhone([id]),
-            new Promise((_,reject)=>setTimeout(()=>reject(Error('LID mapping timeout')),7000))
-          ]);
-          verified=Array.isArray(pairs) && pairs.some(x=>x?.lid===lid && x?.pn===id);
-        }
-        if(verified) {
-          const linked=await bridgePost('/resolve-identity',{
-            workerId:s.workerId,chatId:lid,verifiedPhone:phone
-          });
-          if(linked.leadId!==null && linked.leadId!==undefined) {
-            s.verifiedPhones.set(lid,phone);
-            s.identityRetryAt.delete(lid);
-            console.log('[WhatsApp identity]',s.workerId.slice(0,8),'LID mapped to assigned lead');
-            return;
-          }
-        }
-      }catch(e){console.warn('[WhatsApp identity] lookup:',keep(e,120));}
-    }
-    console.log('[WhatsApp identity]',s.workerId.slice(0,8),'LID unmatched after verified checks');
-  }catch(e){console.warn('[WhatsApp identity] recovery:',keep(e,140));}
-  finally{resolvingLids.delete(key);}
-}
-async function recoverEarlierUnmatched(s){
-  if(!isCurrent(s)||s.status!=='ready')return;
-  try {
-    const d=await bridgePost('/match-candidates',{workerId:s.workerId});
-    if(!d.reason && Array.isArray(d.unmatchedChats)) {
-      for(const lid of d.unmatchedChats.slice(0,8)) {
-        if(!isCurrent(s)||s.status!=='ready')break;
-        await verifyLidAgainstAssignedPhones(s,lid);
-      }
-    }
-  } catch(e){console.warn('[WhatsApp identity] history recovery:',keep(e,120));}
-}
-
 function enqueue(event) {
   const filename=path.join(eventRoot,crypto.createHash('sha256').update(event.workerId+':'+event.eventId).digest('hex')+'.json');
   if (fs.existsSync(filename)) return;
@@ -285,29 +210,11 @@ function wireMessages(s,client) {
     s.status='ready';s.attachStage='ready';s.error=null;s.browserOpen=true;
     if(s.attachWatchdog){clearTimeout(s.attachWatchdog);s.attachWatchdog=null;}s.number=client.info?.wid?.user || null;
     console.log('[WhatsApp]',s.workerId.slice(0,8),'AI ready',s.number);
-    setTimeout(()=>recoverEarlierUnmatched(s).catch(e=>console.warn('[WhatsApp identity]',keep(e))),3500).unref();
   });
   client.on('auth_failure',e=>{if(valid()){s.status='auth_failure';s.attachStage='authentication_failed';s.error=keep(e);}});
   client.on('disconnected',e=>{if(valid()){s.status='ai_disconnected';s.attachStage='disconnected';s.error='WhatsApp disconnected: '+keep(e);s.browserOpen=!!client.pupBrowser?.isConnected?.();}});
-  // WhatsApp versions may emit either event for inbound messages. Accept both
-  // while deduplicating by the provider's unique message ID per worker.
-  const inboundSeen = new Map();
-  const inboundEventId = m => {
-    const id=String(m?.id?._serialized||'');
-    // When no provider ID is supplied, keep the old unique-event fallback.
-    return id || `${m.from}:${m.timestamp}:${crypto.randomUUID()}`;
-  };
-  const handleInbound = (m,source) => {
-    if (!valid() || !m || m.fromMe || !m.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
-    const providerId=String(m?.id?._serialized||'');
-    if (providerId) {
-      if (inboundSeen.has(providerId)) return;
-      inboundSeen.set(providerId,Date.now());
-      if (inboundSeen.size>3000) inboundSeen.delete(inboundSeen.keys().next().value);
-    }
-    console.log('[WhatsApp inbound]',s.workerId.slice(0,8),source,
-      m.from.endsWith('@lid')?'lid':'phone','event accepted');
-
+  client.on('message',m=>{
+    if (!valid() || m.fromMe || !m.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
     // The chat can be a WhatsApp opaque @lid ID, which is NOT a telephone
     // number. Only trust a contact phone if WhatsApp exposes a real @c.us ID.
     void (async()=>{
@@ -352,25 +259,14 @@ function wireMessages(s,client) {
       }
       if(!valid())return;
       if(senderPhone && s.verifiedPhones.size<2500)s.verifiedPhones.set(m.from,senderPhone);
-      const ev={workerId:s.workerId,eventId:inboundEventId(m),
+      const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.from}:${m.timestamp}:${crypto.randomUUID()}`,
         chatId:m.from,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp};
       if(senderPhone)ev.senderPhone=senderPhone;
       enqueue(ev);flush().catch(console.error);
-      if(!senderPhone && m.from.endsWith('@lid')) {
-        setImmediate(()=>verifyLidAgainstAssignedPhones(s,m.from).catch(e=>
-          console.warn('[WhatsApp identity] sender:',keep(e))));
-      }
-    })().catch(e=>{
-      // If the enqueue failed before persisting the event, the other callback
-      // may try again rather than losing the message for this worker.
-      if(providerId) inboundSeen.delete(providerId);
-      console.error('[inbound]',keep(e));
-    });
-  };
-  client.on('message',m=>handleInbound(m,'message'));
+    })().catch(e=>console.error('[inbound]',keep(e)));
+  });
   client.on('message_create',m=>{
-    if (!m?.fromMe) { handleInbound(m,'message_create'); return; }
-    if(!valid() || !m.to || !/@(?:c\.us|lid)$/.test(m.to)) return;
+    if(!valid() || !m.fromMe || !m.to || !/@(?:c\.us|lid)$/.test(m.to)) return;
     const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.to}:${m.timestamp}:${crypto.randomUUID()}`,
       chatId:m.to,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp,direction:'out'};
     // A manual outgoing conversation can later identify the same LID chat.
@@ -583,24 +479,6 @@ async function handler(req,res) {
       if(data.confirmation!=='BACKUP_AND_RESET_PAIRING')return respond(res,400,{error:'Explicit confirmation required'});
       return respond(res,200,await backupAndResetPairing(id));
     }
-    if(req.url==='/recover-identities') {
-      const s=clients.get(id);
-      if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')
-        return respond(res,409,{error:'WhatsApp worker must be READY'});
-      if(s.recoveryRunning)return respond(res,200,{running:true});
-      if(s.lastManualRecoveryAt && Date.now()-s.lastManualRecoveryAt<120000)
-        return respond(res,200,{cooldown:true});
-      s.lastManualRecoveryAt=Date.now();
-      // Manual troubleshooting may recheck a recent unresolved mapping immediately.
-      s.identityRetryAt?.clear();
-      s.recoveryRunning=true;
-      setImmediate(() => {
-        recoverEarlierUnmatched(s)
-          .catch(e=>console.warn('[WhatsApp identity] manual recovery:',keep(e,140)))
-          .finally(()=>{s.recoveryRunning=false;});
-      });
-      return respond(res,200,{started:true});
-    }
     if(req.url==='/verify-number') {
       const s=clients.get(id);
       if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')
@@ -620,8 +498,31 @@ async function handler(req,res) {
       const s=clients.get(id);
       if(!s || !s.active || s.mode!=='ai' || s.status!=='ready')return respond(res,409,{error:'Worker AI not connected'});
       const chat=String(data.chatId||'');const message=String(data.text||'');
-      if(!/^\d{9,20}@(c\.us|lid)$/.test(chat)||!message.trim()||message.length>3000)
+      const mediaFile=String(data.mediaFile||'');
+      const mediaKind=String(data.mediaKind||'');
+      const mediaSha=String(data.mediaSha256||'');
+      if(!/^\d{9,20}@(c\.us|lid)$/.test(chat)||message.length>3000||(!message.trim()&&!mediaFile))
         return respond(res,400,{error:'invalid chat or message'});
+      let validatedMedia=null;
+      if(mediaFile){
+        if(!/^[0-9a-f]{32}\.(pdf|png|jpg|webp|ogg)$/.test(mediaFile) ||
+           !['document','image','voice'].includes(mediaKind) ||
+           !/^[0-9a-f]{64}$/.test(mediaSha))
+          return respond(res,400,{error:'invalid approved media reference'});
+        const extension=path.extname(mediaFile);
+        if ((mediaKind==='document'&&extension!=='.pdf') ||
+            (mediaKind==='image'&&!['.png','.jpg','.webp'].includes(extension)) ||
+            (mediaKind==='voice'&&extension!=='.ogg'))
+          return respond(res,400,{error:'media type mismatch'});
+        const filename=path.join(mediaRoot,mediaFile);
+        const stat=fs.lstatSync(filename,{throwIfNoEntry:true});
+        if(!stat || !stat.isFile() || stat.isSymbolicLink() || stat.size>12*1024*1024 || stat.size<1)
+          return respond(res,400,{error:'unavailable or unsafe media'});
+        const contents=fs.readFileSync(filename);
+        if(crypto.createHash('sha256').update(contents).digest('hex')!==mediaSha)
+          return respond(res,400,{error:'media integrity check failed'});
+        validatedMedia=MessageMedia.fromFilePath(filename);
+      }
       // Typing state is optional; failure must never prevent a legitimate reply.
       // The call is serialized per worker so two replies never type/send together.
       if(s.sending)return respond(res,409,{error:'Worker already sending a message'});
@@ -651,7 +552,9 @@ async function handler(req,res) {
           return typeof id === 'string' && id.length > 0 ? id : null;
         };
         const onOutgoing = m => {
-          if (m?.fromMe === true && m.to === chat && m.body === message) {
+          // For media, the caption can be omitted (voice) or WhatsApp may
+          // encode it differently. Only trust an explicit returned message ID.
+          if (!validatedMedia && m?.fromMe === true && m.to === chat && m.body === message) {
             const confirmedId = messageIdOf(m);
             if (confirmedId) acknowledgeEcho(confirmedId);
           }
@@ -660,7 +563,17 @@ async function handler(req,res) {
         let messageId = null;
         let confirmedBy = null;
         try {
-          const sent = await s.client.sendMessage(chat,message,{sendSeen:false});
+          const options={sendSeen:false};
+          let outbound=message;
+          if(validatedMedia){
+            outbound=validatedMedia;
+            if(mediaKind==='voice')options.sendAudioAsVoice=true;
+            else {
+              options.caption=message.slice(0,1000);
+              if(mediaKind==='document')options.sendMediaAsDocument=true;
+            }
+          }
+          const sent = await s.client.sendMessage(chat,outbound,options);
           messageId = messageIdOf(sent);
           if (messageId) confirmedBy = 'sendMessage';
           if (!messageId) {
