@@ -507,7 +507,7 @@ def answer_one(db,thread,base_data):
             print('[AI media router]',thread['worker_id'][:8], 'lead',thread['lead_id'],
                   'requested',requested,'human',human_required,
                   'selected',bool(matched),'eligible',len(permitted_media),flush=True)
-            if requested and matched and not human_required:
+            if requested and not human_required:
                 if matched in {m['id'] for m in permitted_media}:
                     db.validate_media_choice(thread,matched)
                     record=next(m for m in permitted_media if m['id']==matched)
@@ -517,6 +517,10 @@ def answer_one(db,thread,base_data):
                     return
                 # A previous attempt may be uncertain. Never pretend delivery
                 # or re-send without the operator checking the real chat.
+                # Even if the file is disabled, missing or blocked by an old
+                # uncertain send, asking for a CV is not a human handoff.
+                # Never let a generic Gemini reply promise a delivery or
+                # permanently transfer the conversation in this case.
                 past=[m for m in media_history if m['name']==next(
                     (a['display_name'] for a in full_catalog if a['id']==matched),'')]
                 uncertain=any(m['status'] in ('uncertain','sending','queued_reply') for m in past)

@@ -84,7 +84,7 @@ def render_workers(access,repo):
                 key='ai_media_upload_file_'+chosen)
             label=st.text_input('Attachment name',placeholder='Mohammed CV')
             send_when=st.text_area('When should the AI send this file?',height=90,
-                placeholder='Send only if a recruiter asks for Mohammed’s CV; then hand off.')
+                placeholder='Send the CV when a recruiter requests it; then continue the conversation until a personal decision or interview requires Mohammed.')
             submit=st.form_submit_button('Upload to this profile')
             if submit:
                 if not new_media:

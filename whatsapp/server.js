@@ -14,6 +14,7 @@ const { spawn } = require('node:child_process');
 const { loadWhatsAppWithMediaFix } = require('./compat/media_id_fix');
 const { sdk: whatsAppSDK, mediaCompatibility } = loadWhatsAppWithMediaFix();
 const { Client, NoAuth, MessageMedia } = whatsAppSDK;
+const { messageIdOf, eventIdOf, outgoingMediaEchoMatches } = require('./compat/message_events');
 console.log('[WhatsApp media compatibility]',mediaCompatibility.status,mediaCompatibility.error || '');
 
 const host = '127.0.0.1';
@@ -216,8 +217,24 @@ function wireMessages(s,client) {
   });
   client.on('auth_failure',e=>{if(valid()){s.status='auth_failure';s.attachStage='authentication_failed';s.error=keep(e);}});
   client.on('disconnected',e=>{if(valid()){s.status='ai_disconnected';s.attachStage='disconnected';s.error='WhatsApp disconnected: '+keep(e);s.browserOpen=!!client.pupBrowser?.isConnected?.();}});
-  client.on('message',m=>{
-    if (!valid() || m.fromMe || !m.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
+  // The library sometimes misses the first 'message' callback on newer
+  // WhatsApp Web builds. Handle both independent inbound events, with an
+  // event-ID guard, so one greeting yields ONE CRM inbound event.
+  const receivedRecently = new Map();
+  const ingestInbound = (m, source) => {
+    if (!valid() || m?.fromMe || !m?.from || !/@(?:c\.us|lid)$/.test(m.from)) return;
+    const stableId=eventIdOf(m,m.from,'in');
+    if (receivedRecently.has(stableId)) return;
+    receivedRecently.set(stableId,Date.now());
+    if(receivedRecently.size>1200){
+      for(const [key,t] of receivedRecently){
+        if(Date.now()-t>3600000 || receivedRecently.size>1100) receivedRecently.delete(key);
+        else break;
+      }
+    }
+    console.log('[WhatsApp inbound]',s.workerId.slice(0,8),source,stableId.slice(0,35));
+    // Resolve a verified telephone number only when needed; never invent a
+    // phone number from opaque @lid digits.
     // The chat can be a WhatsApp opaque @lid ID, which is NOT a telephone
     // number. Only trust a contact phone if WhatsApp exposes a real @c.us ID.
     void (async()=>{
@@ -230,7 +247,7 @@ function wireMessages(s,client) {
             m.getContact(),
             new Promise((_,reject)=>setTimeout(()=>reject(Error('contact lookup timed out')),3500))
           ]);
-          const phoneId=String(contact?.id?._serialized||'');
+          const phoneId=String(contact?.id?._serialized||contact?.id?.$1||'');
           if (/^\d{9,15}@c\.us$/.test(phoneId))senderPhone='+'+phoneId.split('@')[0];
         } catch(e) {
           console.warn('[WhatsApp] LID contact lookup:',keep(e,100));
@@ -243,7 +260,7 @@ function wireMessages(s,client) {
               if(typeof client.getContactLidAndPhone==='function'){
                 try {
                   const list=await client.getContactLidAndPhone([m.from]);
-                  if(/^\d{9,15}@c\.us$/.test(String(list?.[0]?.pn||'')))return list[0].pn;
+                  if(/^\d{9,15}@c\.us$/.test(String(list?.[0]?.pn?._serialized||list?.[0]?.pn?.$1||list?.[0]?.pn||'')))return list[0].pn;
                 }catch(_) {/* Try WhatsApp Store's direct resolver below. */}
               }
               return await client.pupPage.evaluate(async lid=>{
@@ -262,15 +279,21 @@ function wireMessages(s,client) {
       }
       if(!valid())return;
       if(senderPhone && s.verifiedPhones.size<2500)s.verifiedPhones.set(m.from,senderPhone);
-      const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.from}:${m.timestamp}:${crypto.randomUUID()}`,
+      const ev={workerId:s.workerId,eventId:stableId,
         chatId:m.from,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp};
       if(senderPhone)ev.senderPhone=senderPhone;
       enqueue(ev);flush().catch(console.error);
-    })().catch(e=>console.error('[inbound]',keep(e)));
-  });
+    })().catch(e=>{
+      receivedRecently.delete(stableId); // allow a later event to recover from a local error
+      console.error('[inbound]',keep(e));
+    });
+  };
+  client.on('message',m=>ingestInbound(m,'message'));
   client.on('message_create',m=>{
-    if(!valid() || !m.fromMe || !m.to || !/@(?:c\.us|lid)$/.test(m.to)) return;
-    const ev={workerId:s.workerId,eventId:m.id?._serialized || `${m.to}:${m.timestamp}:${crypto.randomUUID()}`,
+    if(!valid())return;
+    if(!m?.fromMe){ ingestInbound(m,'message_create_fallback'); return; }
+    if(!m.to || !/@(?:c\.us|lid)$/.test(m.to))return;
+    const ev={workerId:s.workerId,eventId:eventIdOf(m,m.to,'out'),
       chatId:m.to,text:String(m.body||'').slice(0,3000),sentAt:m.timestamp,direction:'out'};
     // A manual outgoing conversation can later identify the same LID chat.
     void (async()=>{
@@ -280,7 +303,7 @@ function wireMessages(s,client) {
             if(typeof client.getContactLidAndPhone==='function'){
               try {
                 const data=await client.getContactLidAndPhone([m.to]);
-                if(/^\d{9,15}@c\.us$/.test(String(data?.[0]?.pn||'')))return data[0].pn;
+                if(/^\d{9,15}@c\.us$/.test(String(data?.[0]?.pn?._serialized||data?.[0]?.pn?.$1||data?.[0]?.pn||'')))return data[0].pn;
               }catch(_) {/* Try the active WhatsApp Store. */}
             }
             return client.pupPage.evaluate(async lid=>{
@@ -561,11 +584,13 @@ async function handler(req,res) {
           const lo=Math.max(0,Math.min(60,Number(data.delayMin)||0));
           const hi=Math.max(lo,Math.min(60,Number(data.delayMax)||lo));
           const waitSeconds=lo+Math.floor(Math.random()*(hi-lo+1));
-          try {
-            chatObject=await s.client.getChatById(chat);
-            if(chatObject && typeof chatObject.sendStateTyping==='function')
-              await chatObject.sendStateTyping();
-          }catch(e){console.warn('[WhatsApp] Typing indicator unavailable:',keep(e,100));}
+          if(!validatedMedia) {
+            try {
+              chatObject=await s.client.getChatById(chat);
+              if(chatObject && typeof chatObject.sendStateTyping==='function')
+                await chatObject.sendStateTyping();
+            }catch(e){console.warn('[WhatsApp] Typing indicator unavailable:',keep(e,100));}
+          }
           if(waitSeconds>0)await new Promise(resolve=>setTimeout(resolve,waitSeconds*1000));
           if(!s.active || s.status!=='ready')throw httpError(409,'Worker disconnected before send');
         }
@@ -575,30 +600,14 @@ async function handler(req,res) {
         // If neither source provides an ID, report uncertainty; NEVER retry.
         let acknowledgeEcho;
         const echo = new Promise(resolve => { acknowledgeEcho = resolve; });
-        const messageIdOf = m => {
-          const id = m?.id?._serialized;
-          return typeof id === 'string' && id.length > 0 ? id : null;
-        };
         const onOutgoing = m => {
           // Listen for an ACTUAL outgoing WhatsApp message with a MsgKey.
           // A media send may return no Message ID from sendMessage even when
           // message_create receives the queued PDF/image/voice. Do not count
           // unrelated text messages as evidence that an attachment was sent.
-          if (m?.fromMe !== true || m.to !== chat) return;
-          const confirmedId = messageIdOf(m);
-          if (!confirmedId) return;
-          if (!validatedMedia) {
-            if (m.body === message && !m.hasMedia) acknowledgeEcho(confirmedId);
-            return;
-          }
-          const kindMatches = (mediaKind === 'document' && m.type === 'document') ||
-            (mediaKind === 'image' && m.type === 'image') ||
-            (mediaKind === 'voice' && (m.type === 'ptt' || m.type === 'audio'));
-          // For documents/images WhatsApp normally preserves the caption;
-          // voice notes have no caption. Don't accept a matching text echo.
-          const captionMatches = mediaKind === 'voice' || !message.trim() ||
-            String(m.body || '') === message.slice(0,1000);
-          if (kindMatches && captionMatches) acknowledgeEcho(confirmedId);
+          if (!outgoingMediaEchoMatches(m,chat,mediaKind,message,Boolean(validatedMedia))) return;
+          const confirmedId=messageIdOf(m);
+          if (confirmedId) acknowledgeEcho(confirmedId);
         };
         s.client.on('message_create',onOutgoing);
         let messageId = null;
@@ -614,7 +623,14 @@ async function handler(req,res) {
               if(mediaKind==='document')options.sendMediaAsDocument=true;
             }
           }
-          const sent = await s.client.sendMessage(chat,outbound,options);
+          let sent;
+          try {
+            sent = await s.client.sendMessage(chat,outbound,options);
+          } catch (error) {
+            console.error('[WhatsApp attachment send failed]',id.slice(0,8),
+              validatedMedia ? mediaKind : 'text',keep(error,280));
+            throw error; // Never fake a successful send or silently auto-retry.
+          }
           messageId = messageIdOf(sent);
           if (messageId) confirmedBy = 'sendMessage';
           if (!messageId) {

@@ -295,6 +295,37 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(c.execute("SELECT count(*) FROM ai_messages WHERE direction='out'").fetchone()[0],0)
             self.assertEqual(c.execute('SELECT count(*) FROM ai_lead_control WHERE handoff=1').fetchone()[0],0)
 
+
+    def test_matching_uploaded_media_unavailable_no_immediate_handoff(self):
+        mid,_=self.upload()
+        self.db.set_media_enabled(mid,False)
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        with patch.object(ai_agent,'gemini_with_fallback',return_value=(json.dumps(
+            {'file_requested':True,'human_required':False,'media_id':mid}),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            outbound=c.execute('SELECT status,media_id,kind,body FROM ai_messages WHERE direction="out"').fetchone()
+            ctrl=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
+        self.assertEqual(outbound['status'],'queued_reply')
+        self.assertIsNone(outbound['media_id'])
+        self.assertNotEqual(outbound['kind'],'handoff')
+        self.assertFalse(ctrl and ctrl['handoff'])
+
+    def test_cv_request_without_matching_media_does_not_handoff(self):
+        self.upload()
+        self.db.working_models=lambda wid:['model1']
+        self.db.token_budget_available=lambda *a,**kw:True
+        with patch.object(ai_agent,'gemini_with_fallback',return_value=(json.dumps(
+            {'file_requested':True,'human_required':False,'media_id':None}),{})):
+            ai_agent.answer_one(self.db,self.thread,self.tmp.name)
+        with self.db.connect() as c:
+            outbound=c.execute('SELECT status,media_id,kind,body FROM ai_messages WHERE direction="out"').fetchone()
+            ctrl=c.execute('SELECT handoff FROM ai_lead_control WHERE lead_id=1').fetchone()
+        self.assertIsNone(outbound['media_id'])
+        self.assertNotEqual(outbound['kind'],'handoff')
+        self.assertFalse(ctrl and ctrl['handoff'])
+
     def test_router_selects_before_main_model_and_dispatches(self):
         mid,_=self.upload()
         self.db.working_models=lambda wid:['model1']
